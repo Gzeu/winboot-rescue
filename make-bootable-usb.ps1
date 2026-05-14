@@ -87,42 +87,50 @@ function Initialize-WorkDir {
 function Get-UsbDrives {
     <#
     .SYNOPSIS Returns all removable USB disks with size info.
+    .NOTES  Result is always wrapped in @() so .Count is safe under StrictMode
+            even when only one USB drive is present.
     #>
     Write-Log "Scanning for USB drives..." -Level STEP
 
-    $usbDisks = @()
+    # @() ensures the result is always an array, even for 0 or 1 items.
+    # Without this, a single object returned by Where-Object is a PSObject,
+    # not an array, causing .Count to fail under Set-StrictMode -Version Latest.
+    $usbDisks = [System.Collections.Generic.List[object]]::new()
     try {
-        $allDisks = Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.BusType -eq 'USB' }
+        $allDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.BusType -eq 'USB' })
         foreach ($d in $allDisks) {
-            $volumes = Get-Partition -DiskNumber $d.DiskNumber -ErrorAction SilentlyContinue |
-                       ForEach-Object { Get-Volume -Partition $_ -ErrorAction SilentlyContinue }
-            $usbDisks += [PSCustomObject]@{
+            $volumes = @(Get-Partition -DiskNumber $d.DiskNumber -ErrorAction SilentlyContinue |
+                       ForEach-Object { Get-Volume -Partition $_ -ErrorAction SilentlyContinue })
+            $letters = ($volumes | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter):" }) -join ', '
+            $usbDisks.Add([PSCustomObject]@{
                 DiskNumber = $d.DiskNumber
                 Model      = $d.FriendlyName
                 SizeGB     = [math]::Round($d.Size / 1GB, 1)
                 Status     = $d.OperationalStatus
                 Volumes    = $volumes
-                Letters    = ($volumes | Where-Object { $_.DriveLetter } | ForEach-Object { "$($_.DriveLetter):" }) -join ', '
-            }
-            Write-Log "  Found USB: Disk $($d.DiskNumber) | $($d.FriendlyName) | $([math]::Round($d.Size/1GB,1)) GB | Letters: $(if ($volumes) {($volumes|Where-Object{$_.DriveLetter}|ForEach-Object{"$($_.DriveLetter):"}) -join ', '} else {'none'})" -Level INFO
+                Letters    = $letters
+            })
+            Write-Log "  Found USB: Disk $($d.DiskNumber) | $($d.FriendlyName) | $([math]::Round($d.Size/1GB,1)) GB | Letters: $(if ($letters) {$letters} else {'none'})" -Level INFO
         }
     } catch {
         Write-Log "Error enumerating USB disks: $_" -Level ERROR
     }
 
-    if ($usbDisks.Count -eq 0) {
-        Write-Log "No USB drives found. Insert a USB drive and re-run." -Level ERROR
-    }
-
-    return $usbDisks
+    # Return as a plain array so callers can safely use .Count
+    return @($usbDisks)
 }
 
 function Select-UsbDrive {
     <#
     .SYNOPSIS Shows USB drive list and asks user to select one.
+    .NOTES  $usbs is wrapped in @() here too — belt-and-suspenders against
+            StrictMode .Count issues if Get-UsbDrives ever returns a single item.
     #>
-    $usbs = Get-UsbDrives
-    if ($usbs.Count -eq 0) { return $null }
+    $usbs = @(Get-UsbDrives)
+    if ($usbs.Count -eq 0) {
+        Write-Log "No USB drives found. Insert a USB drive and re-run." -Level ERROR
+        return $null
+    }
 
     Write-Host "`n$('='*60)" -ForegroundColor White
     Write-Host "  SELECT USB DRIVE TO FORMAT" -ForegroundColor Yellow
@@ -138,8 +146,10 @@ function Select-UsbDrive {
     do {
         $choice = Read-Host "Select USB drive (1-$($usbs.Count)) or Q to quit"
         if ($choice -match '^[Qq]$') { return $null }
-        $idx = [int]$choice - 1
-    } while ($idx -lt 0 -or $idx -ge $usbs.Count)
+        [int]$idx = 0
+        $validNum = [int]::TryParse($choice, [ref]$idx)
+        $idx = $idx - 1
+    } while (-not $validNum -or $idx -lt 0 -or $idx -ge $usbs.Count)
 
     $selected = $usbs[$idx]
     Write-Log "User selected: Disk $($selected.DiskNumber) -- $($selected.Model) -- $($selected.SizeGB) GB" -Level SUCCESS
@@ -217,8 +227,7 @@ active
 
     # Find the new drive letter
     Start-Sleep -Seconds 2
-    $newDisk = Get-Disk -Number $diskNum -ErrorAction SilentlyContinue
-    $newPart = Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue | Select-Object -First 1
+    $newPart = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue) | Select-Object -First 1
     $newVol  = if ($newPart) { Get-Volume -Partition $newPart -ErrorAction SilentlyContinue } else { $null }
 
     if ($newVol -and $newVol.DriveLetter) {
@@ -665,7 +674,7 @@ function Test-UsbBoot {
     $allGood = $true
     foreach ($c in $checks) {
         $exists = Test-Path $c.Path -ErrorAction SilentlyContinue
-        $status = if ($exists) { 'SUCCESS' } elseif ($c.Required) { 'ERROR'; $allGood = $false } else { 'WARN' }
+        $status = if ($exists) { 'SUCCESS' } elseif ($c.Required) { $allGood = $false; 'ERROR' } else { 'WARN' }
         $icon   = if ($exists) { '[OK]' } else { '[MISSING]' }
         Write-Log "  $icon $($c.Label)" -Level $status
     }
