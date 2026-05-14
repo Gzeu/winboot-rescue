@@ -32,6 +32,7 @@
 
     COMPAT  : Windows 10/11 (x64), run from standard Windows session
     AUTHOR  : winboot-rescue toolkit
+    FIXES   : copype.cmd path detection, ReadKey crash, ADK sub-path scan
 #>
 
 Set-StrictMode -Version Latest
@@ -70,6 +71,21 @@ function Write-Log {
     }
 }
 
+# Safe "press any key" — works in all PS hosts including cmd-launched sessions
+function Wait-KeyPress {
+    param([string]$Prompt = 'Press Enter to continue...')
+    Write-Host "`n$Prompt" -ForegroundColor DarkGray
+    try {
+        # Try ReadKey first (works in interactive terminal)
+        if ($Host.UI.RawUI.KeyAvailable -ne $null) {
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            return
+        }
+    } catch {}
+    # Fallback: Read-Host works everywhere
+    Read-Host | Out-Null
+}
+
 function Initialize-WorkDir {
     $Script:WorkDir  = Join-Path $env:TEMP 'WinBootUSB'
     $Script:MountDir = Join-Path $Script:WorkDir 'mount'
@@ -92,9 +108,6 @@ function Get-UsbDrives {
     #>
     Write-Log "Scanning for USB drives..." -Level STEP
 
-    # @() ensures the result is always an array, even for 0 or 1 items.
-    # Without this, a single object returned by Where-Object is a PSObject,
-    # not an array, causing .Count to fail under Set-StrictMode -Version Latest.
     $usbDisks = [System.Collections.Generic.List[object]]::new()
     try {
         $allDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.BusType -eq 'USB' })
@@ -116,16 +129,10 @@ function Get-UsbDrives {
         Write-Log "Error enumerating USB disks: $_" -Level ERROR
     }
 
-    # Return as a plain array so callers can safely use .Count
     return @($usbDisks)
 }
 
 function Select-UsbDrive {
-    <#
-    .SYNOPSIS Shows USB drive list and asks user to select one.
-    .NOTES  $usbs is wrapped in @() here too — belt-and-suspenders against
-            StrictMode .Count issues if Get-UsbDrives ever returns a single item.
-    #>
     $usbs = @(Get-UsbDrives)
     if ($usbs.Count -eq 0) {
         Write-Log "No USB drives found. Insert a USB drive and re-run." -Level ERROR
@@ -170,10 +177,6 @@ function Select-UsbDrive {
 # SECTION 2: FORMAT USB
 # ============================================================
 function Format-UsbDrive {
-    <#
-    .SYNOPSIS Wipes and formats the selected USB drive as FAT32 (GPT or MBR).
-    .PARAMETER PartitionStyle  'GPT' (for UEFI-only) or 'MBR' (for BIOS+UEFI compat)
-    #>
     param(
         [ValidateSet('GPT','MBR')][string]$PartitionStyle = 'MBR'
     )
@@ -186,7 +189,6 @@ function Format-UsbDrive {
     $diskNum = $Script:SelectedUSB.DiskNumber
     Write-Log "Formatting Disk $diskNum as $PartitionStyle / FAT32..." -Level SECTION
 
-    # Build diskpart script
     if ($PartitionStyle -eq 'GPT') {
         $dpScript = @"
 select disk $diskNum
@@ -195,10 +197,8 @@ convert gpt
 create partition primary
 format fs=fat32 quick label="WinRescue"
 assign
-active
 "@
     } else {
-        # MBR -- most compatible (boots on BIOS and most UEFI with CSM)
         $dpScript = @"
 select disk $diskNum
 clean
@@ -225,7 +225,7 @@ active
         Write-Log "Disk $diskNum formatted successfully as $PartitionStyle/FAT32." -Level SUCCESS
     }
 
-    # Find the new drive letter
+    # Find new drive letter
     Start-Sleep -Seconds 2
     $newPart = @(Get-Partition -DiskNumber $diskNum -ErrorAction SilentlyContinue) | Select-Object -First 1
     $newVol  = if ($newPart) { Get-Volume -Partition $newPart -ErrorAction SilentlyContinue } else { $null }
@@ -235,7 +235,7 @@ active
         return "$($newVol.DriveLetter):"
     }
 
-    # Fallback: assign letter via diskpart
+    # Fallback: assign letter
     Write-Log "No drive letter assigned. Assigning via diskpart..." -Level WARN
     $freeLetter = Get-FirstFreeLetter
     if ($freeLetter) {
@@ -266,72 +266,112 @@ function Get-FirstFreeLetter {
 # ============================================================
 function Find-AdkPath {
     <#
-    .SYNOPSIS Finds the Windows ADK installation path.
-    .RETURNS Path to ADK root or $null if not installed.
+    .SYNOPSIS Finds the Windows ADK installation path and locates copype.cmd.
+    .RETURNS Hashtable with AdkRoot and CopypePath, or $null if not found.
+    .NOTES   ADK + WinPE Add-on must both be installed.
+             copype.cmd is part of the WinPE Add-on, not base ADK.
+             Scans registry first, then common install paths, then deep search.
     #>
-    $adkPaths = @(
+
+    # Step 1: Try registry for ADK root
+    $adkRoot = $null
+    $adkRegPaths = @(
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots',
         'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots'
     )
-    foreach ($regPath in $adkPaths) {
-        $key = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
-        if ($key -and $key.KitsRoot10) {
-            $adkRoot = $key.KitsRoot10
-            Write-Log "ADK found at: $adkRoot" -Level SUCCESS
-            return $adkRoot
+    foreach ($regPath in $adkRegPaths) {
+        try {
+            $key = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
+            if ($key -and $key.KitsRoot10) {
+                $adkRoot = $key.KitsRoot10.TrimEnd('\')
+                break
+            }
+        } catch {}
+    }
+
+    # Step 2: Fallback to common install directories
+    if (-not $adkRoot) {
+        $commonPaths = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10",
+            "${env:ProgramFiles}\Windows Kits\10",
+            'C:\Program Files (x86)\Windows Kits\10',
+            'C:\Program Files\Windows Kits\10'
+        )
+        foreach ($p in $commonPaths) {
+            if (Test-Path $p -ErrorAction SilentlyContinue) {
+                $adkRoot = $p
+                break
+            }
         }
     }
 
-    # Common install paths
-    $commonPaths = @(
-        'C:\Program Files (x86)\Windows Kits\10',
-        'C:\Program Files\Windows Kits\10'
-    )
-    foreach ($p in $commonPaths) {
-        if (Test-Path $p) {
-            Write-Log "ADK found (path scan): $p" -Level SUCCESS
-            return $p
+    if (-not $adkRoot) {
+        Write-Log "Windows ADK not found." -Level WARN
+        return $null
+    }
+
+    Write-Log "ADK root found: $adkRoot" -Level SUCCESS
+
+    # Step 3: Locate copype.cmd — it ships with the WinPE Add-on
+    # Standard path relative to ADK root:
+    $copypeRelative = 'Assessment and Deployment Kit\Windows Preinstallation Environment\copype.cmd'
+    $copypeStandard = Join-Path $adkRoot $copypeRelative
+    if (Test-Path $copypeStandard -ErrorAction SilentlyContinue) {
+        Write-Log "copype.cmd found: $copypeStandard" -Level SUCCESS
+        return @{ AdkRoot = $adkRoot; CopypePath = $copypeStandard }
+    }
+
+    # Step 4: Deep search under ADK root for copype.cmd
+    Write-Log "copype.cmd not at standard path. Searching under ADK root..." -Level WARN
+    try {
+        $found = Get-ChildItem -Path $adkRoot -Filter 'copype.cmd' -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        if ($found) {
+            Write-Log "copype.cmd found via search: $($found.FullName)" -Level SUCCESS
+            return @{ AdkRoot = $adkRoot; CopypePath = $found.FullName }
         }
+    } catch {}
+
+    # Step 5: Search whole Program Files
+    Write-Log "Searching Program Files for copype.cmd..." -Level WARN
+    foreach ($searchRoot in @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
+        if (-not $searchRoot) { continue }
+        try {
+            $found = Get-ChildItem -Path $searchRoot -Filter 'copype.cmd' -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+            if ($found) {
+                Write-Log "copype.cmd found: $($found.FullName)" -Level SUCCESS
+                return @{ AdkRoot = $adkRoot; CopypePath = $found.FullName }
+            }
+        } catch {}
     }
 
-    Write-Log "Windows ADK not found." -Level WARN
-    return $null
-}
-
-function Find-WinPeAddon {
-    param([string]$AdkRoot)
-    $wpeRoot = Join-Path $AdkRoot 'Assessment and Deployment Kit\Windows Preinstallation Environment'
-    if (Test-Path $wpeRoot) {
-        Write-Log "WinPE Add-on found: $wpeRoot" -Level SUCCESS
-        return $wpeRoot
-    }
-    Write-Log "WinPE Add-on not found at: $wpeRoot" -Level WARN
-    return $null
+    Write-Log "ADK found at $adkRoot but copype.cmd is missing." -Level WARN
+    Write-Log "Install the WinPE Add-on for ADK: https://learn.microsoft.com/windows-hardware/get-started/adk-install" -Level WARN
+    # Return ADK found but no copype — caller can decide
+    return @{ AdkRoot = $adkRoot; CopypePath = $null }
 }
 
 # ============================================================
 # SECTION 4: MODE A -- ADK WinPE BUILD
 # ============================================================
 function Build-WinPeUsb {
-    <#
-    .SYNOPSIS Full WinPE USB creation using ADK copype + DISM + bcdboot.
-    .PARAMETER UsbLetter  Drive letter of the formatted USB (e.g. 'F:')
-    .PARAMETER AdkRoot    Path to ADK installation
-    #>
-    param([string]$UsbLetter, [string]$AdkRoot)
+    param([string]$UsbLetter, [hashtable]$AdkInfo)
 
     Write-Log "Building WinPE environment using ADK..." -Level SECTION
 
-    $copype  = Join-Path $AdkRoot 'Assessment and Deployment Kit\Windows Preinstallation Environment\copype.cmd'
+    $copype  = $AdkInfo.CopypePath
+    $adkRoot = $AdkInfo.AdkRoot
     $wpePe   = Join-Path $Script:WorkDir 'WinPE_amd64'
 
-    if (-not (Test-Path $copype)) {
-        Write-Log "copype.cmd not found at: $copype" -Level ERROR
+    if (-not $copype -or -not (Test-Path $copype)) {
+        Write-Log "copype.cmd not available. Cannot build WinPE." -Level ERROR
+        Write-Log "Install the WinPE Add-on: https://learn.microsoft.com/windows-hardware/get-started/adk-install" -Level WARN
         return $false
     }
 
     # Run copype to generate WinPE working files
-    Write-Log "Running copype amd64 $wpePe ..." -Level STEP
+    Write-Log "Running: copype amd64 $wpePe ..." -Level STEP
     $cpResult = & cmd.exe /c "`"$copype`" amd64 `"$wpePe`"" 2>&1
     $cpResult | ForEach-Object { Write-Log "  $_" -Level INFO }
 
@@ -340,44 +380,42 @@ function Build-WinPeUsb {
         Write-Log "copype failed -- boot.wim not found at $wpeWim" -Level ERROR
         return $false
     }
-    Write-Log "copype completed. boot.wim: $wpeWim" -Level SUCCESS
+    Write-Log "copype completed. boot.wim ready." -Level SUCCESS
 
-    # Mount boot.wim, inject tools
+    # Mount boot.wim and inject toolkit
     $mountDir = Join-Path $Script:WorkDir 'pe_mount'
     if (-not (Test-Path $mountDir)) { New-Item -ItemType Directory $mountDir -Force | Out-Null }
 
-    Write-Log "Mounting boot.wim for customization..." -Level STEP
+    Write-Log "Mounting WinPE image for customization..." -Level STEP
     $dismMount = & dism.exe /Mount-Image /ImageFile:"$wpeWim" /Index:1 /MountDir:"$mountDir" 2>&1
     $dismMount | ForEach-Object { Write-Log "  $_" -Level INFO }
 
     if ($LASTEXITCODE -ne 0) {
         Write-Log "DISM mount failed. Proceeding without customization." -Level WARN
     } else {
-        # Copy our toolkit into the WinPE image
         $peToolDir = Join-Path $mountDir 'Windows\System32\winboot-rescue'
         New-Item -ItemType Directory -Path $peToolDir -Force | Out-Null
-        $toolFiles = @('boot-repair.ps1', 'boot-repair.cmd')
-        foreach ($f in $toolFiles) {
+        foreach ($f in @('boot-repair.ps1', 'boot-repair.cmd')) {
             $src = Join-Path $Script:ToolkitDir $f
             if (Test-Path $src) {
                 Copy-Item $src $peToolDir -Force
                 Write-Log "  Injected $f into WinPE image." -Level SUCCESS
             } else {
-                Write-Log "  $f not found in $Script:ToolkitDir -- skipping injection." -Level WARN
+                Write-Log "  $f not found -- skipping injection." -Level WARN
             }
         }
 
-        # Append boot hint to startnet.cmd (wpeinit must stay first)
+        # Add boot hint to startnet.cmd
         $startupHint = Join-Path $mountDir 'Windows\System32\startnet.cmd'
         try {
-            $existing = Get-Content $startupHint -ErrorAction SilentlyContinue
+            $existing = Get-Content $startupHint -Raw -ErrorAction SilentlyContinue
             if ($existing -notmatch 'winboot-rescue') {
                 Add-Content -Path $startupHint -Value "`r`necho." -Encoding ASCII
-                Add-Content -Path $startupHint -Value "echo  winboot-rescue: X:\Windows\System32\winboot-rescue\boot-repair.cmd" -Encoding ASCII
+                Add-Content -Path $startupHint -Value 'echo  winboot-rescue: X:\Windows\System32\winboot-rescue\boot-repair.cmd' -Encoding ASCII
+                Add-Content -Path $startupHint -Value 'echo  OR from USB root: navigate to USB letter and run boot-repair.cmd' -Encoding ASCII
             }
         } catch {}
 
-        # Unmount and commit
         Write-Log "Committing WinPE image changes..." -Level STEP
         $dismUnmount = & dism.exe /Unmount-Image /MountDir:"$mountDir" /Commit 2>&1
         $dismUnmount | ForEach-Object { Write-Log "  $_" -Level INFO }
@@ -385,25 +423,24 @@ function Build-WinPeUsb {
             Write-Log "WinPE image customized and committed." -Level SUCCESS
         } else {
             Write-Log "DISM unmount had errors -- image may still work." -Level WARN
+            & dism.exe /Unmount-Image /MountDir:"$mountDir" /Discard 2>&1 | Out-Null
         }
     }
 
-    # Copy WinPE files to USB
+    # Copy WinPE media files to USB
     Write-Log "Copying WinPE media to USB $UsbLetter ..." -Level STEP
     $mediaDir = Join-Path $wpePe 'media'
-    $copyResult = & robocopy.exe "$mediaDir" "$UsbLetter\" /E /NFL /NDL /NJH /NJS 2>&1
-    Write-Log "robocopy exit: $LASTEXITCODE (0-7 = OK)" -Level INFO
+    & robocopy.exe "$mediaDir" "$UsbLetter\" /E /NFL /NDL /NJH /NJS 2>&1 | Out-Null
+    Write-Log "robocopy exit: $LASTEXITCODE (0-7 = success)" -Level INFO
 
-    # Run bcdboot for safety on MBR USB
-    $windowsDir = Join-Path $UsbLetter 'Windows'
-    if (Test-Path $windowsDir) {
-        Write-Log "Running bcdboot to ensure boot sector..." -Level STEP
-        & bcdboot.exe "$windowsDir" /s "$UsbLetter" /f ALL 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
+    # Run bcdboot for MBR boot sector
+    $peWinDir = Join-Path $UsbLetter 'Windows'
+    if (Test-Path $peWinDir) {
+        Write-Log "Running bcdboot to write boot sector..." -Level STEP
+        & bcdboot.exe "$peWinDir" /s "$UsbLetter" /f ALL 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
     }
 
-    # Copy toolkit to USB root for easy access
     Copy-ToolkitToUsb -UsbLetter $UsbLetter
-
     Write-Log "WinPE USB creation complete!" -Level SUCCESS
     return $true
 }
@@ -412,34 +449,25 @@ function Build-WinPeUsb {
 # SECTION 5: MODE B -- WinRE from local machine
 # ============================================================
 function Build-WinReUsb {
-    <#
-    .SYNOPSIS Uses the local machine's WinRE.wim to create a bootable USB.
-    .PARAMETER UsbLetter  Drive letter of formatted USB
-    .NOTES Does not require ADK. Uses reagentc to locate WinRE.wim.
-    #>
     param([string]$UsbLetter)
 
     Write-Log "Building WinRE USB from local Windows Recovery Environment..." -Level SECTION
 
-    # Find WinRE.wim
     $winReWim = Find-WinReWim
     if (-not $winReWim) {
         Write-Log "WinRE.wim not found. Cannot use Mode B." -Level ERROR
         return $false
     }
-
     Write-Log "WinRE.wim found: $winReWim" -Level SUCCESS
 
-    # Create sources folder on USB
     $usbSources = Join-Path $UsbLetter 'sources'
     if (-not (Test-Path $usbSources)) { New-Item -ItemType Directory $usbSources -Force | Out-Null }
 
-    # Copy WinRE.wim as boot.wim
     $bootWimDest = Join-Path $usbSources 'boot.wim'
     Write-Log "Copying WinRE.wim to USB as sources\boot.wim ..." -Level STEP
     try {
         Copy-Item $winReWim $bootWimDest -Force
-        Write-Log "boot.wim copied successfully." -Level SUCCESS
+        Write-Log "boot.wim copied." -Level SUCCESS
     } catch {
         Write-Log "Failed to copy WinRE.wim: $_" -Level ERROR
         return $false
@@ -450,7 +478,7 @@ function Build-WinReUsb {
     if (-not (Test-Path $mountDir)) { New-Item -ItemType Directory $mountDir -Force | Out-Null }
 
     Write-Log "Mounting WinRE image to inject toolkit..." -Level STEP
-    $dismMount = & dism.exe /Mount-Image /ImageFile:"$bootWimDest" /Index:1 /MountDir:"$mountDir" 2>&1
+    & dism.exe /Mount-Image /ImageFile:"$bootWimDest" /Index:1 /MountDir:"$mountDir" 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $reToolDir = Join-Path $mountDir 'Windows\System32\winboot-rescue'
         New-Item -ItemType Directory -Path $reToolDir -Force | Out-Null
@@ -461,39 +489,39 @@ function Build-WinReUsb {
                 Write-Log "  Injected $f into WinRE image." -Level SUCCESS
             }
         }
-
-        & dism.exe /Unmount-Image /MountDir:"$mountDir" /Commit 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
+        & dism.exe /Unmount-Image /MountDir:"$mountDir" /Commit 2>&1 |
+            ForEach-Object { Write-Log "  $_" -Level INFO }
     } else {
-        Write-Log "Could not mount WinRE.wim for injection -- toolkit will be on USB root instead." -Level WARN
+        Write-Log "Could not mount WinRE.wim -- toolkit will be on USB root only." -Level WARN
         & dism.exe /Unmount-Image /MountDir:"$mountDir" /Discard 2>&1 | Out-Null
     }
 
-    # Copy boot files from Windows installation
-    $windowsBoot = 'C:\Windows\Boot'
+    # Copy Windows boot files
+    $windowsBoot = "$env:SystemRoot\Boot"
     if (Test-Path $windowsBoot) {
         Write-Log "Copying Windows boot files to USB..." -Level STEP
-        & robocopy.exe "$windowsBoot\EFI" "$UsbLetter\EFI" /E /NFL /NDL /NJH /NJS 2>&1 | Out-Null
+        & robocopy.exe "$windowsBoot\EFI"  "$UsbLetter\EFI"  /E /NFL /NDL /NJH /NJS 2>&1 | Out-Null
         & robocopy.exe "$windowsBoot\PCAT" "$UsbLetter\Boot" /E /NFL /NDL /NJH /NJS 2>&1 | Out-Null
         Write-Log "Boot files copied." -Level SUCCESS
     }
 
-    # Make USB bootable with bcdboot
+    # bcdboot for UEFI + BIOS
     $systemRoot = $env:SystemRoot
     Write-Log "Running bcdboot to create boot entries on USB..." -Level STEP
     $bcdResult = & bcdboot.exe "$systemRoot" /s "$UsbLetter" /f ALL 2>&1
     $bcdResult | ForEach-Object { Write-Log "  $_" -Level INFO }
-
     if ($LASTEXITCODE -eq 0) {
-        Write-Log "bcdboot completed successfully." -Level SUCCESS
+        Write-Log "bcdboot completed." -Level SUCCESS
     } else {
-        Write-Log "bcdboot returned $LASTEXITCODE -- USB may still boot but verify." -Level WARN
+        Write-Log "bcdboot returned $LASTEXITCODE -- USB may still boot." -Level WARN
     }
 
-    # Bootsect for MBR/BIOS compatibility
-    $bootsect = 'C:\Windows\System32\bootsect.exe'
+    # bootsect for BIOS MBR
+    $bootsect = "$env:SystemRoot\System32\bootsect.exe"
     if (Test-Path $bootsect) {
         Write-Log "Running bootsect for MBR/BIOS compatibility..." -Level STEP
-        & $bootsect /nt60 "$UsbLetter" /force /mbr 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
+        & $bootsect /nt60 "$UsbLetter" /force /mbr 2>&1 |
+            ForEach-Object { Write-Log "  $_" -Level INFO }
     }
 
     Copy-ToolkitToUsb -UsbLetter $UsbLetter
@@ -502,10 +530,7 @@ function Build-WinReUsb {
 }
 
 function Find-WinReWim {
-    <#
-    .SYNOPSIS Locates WinRE.wim on the local system.
-    #>
-    # Check reagentc first
+    # Try reagentc
     try {
         $reagentOut = & reagentc.exe /info 2>&1 | Out-String
         if ($reagentOut -match 'Windows RE location\s*:\s*(.+\.wim)') {
@@ -514,18 +539,15 @@ function Find-WinReWim {
         }
     } catch {}
 
-    # Common locations
     $candidates = @(
-        'C:\Windows\System32\Recovery\WinRE.wim',
+        "$env:SystemRoot\System32\Recovery\WinRE.wim",
         'C:\Recovery\WindowsRE\WinRE.wim',
-        'D:\Recovery\WindowsRE\WinRE.wim',
-        "$env:SystemRoot\System32\Recovery\WinRE.wim"
+        'D:\Recovery\WindowsRE\WinRE.wim'
     )
     foreach ($p in $candidates) {
         if (Test-Path $p -ErrorAction SilentlyContinue) { return $p }
     }
 
-    # Search Recovery partitions
     try {
         $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady }
         foreach ($d in $drives) {
@@ -541,11 +563,6 @@ function Find-WinReWim {
 # SECTION 6: MODE C -- Windows ISO
 # ============================================================
 function Build-IsoUsb {
-    <#
-    .SYNOPSIS Uses a Windows ISO file to create a bootable USB.
-    .PARAMETER UsbLetter   Drive letter of formatted USB
-    .PARAMETER IsoPath     Path to Windows 10/11 ISO file
-    #>
     param([string]$UsbLetter, [string]$IsoPath)
 
     Write-Log "Building USB from Windows ISO: $IsoPath" -Level SECTION
@@ -555,7 +572,6 @@ function Build-IsoUsb {
         return $false
     }
 
-    # Mount ISO
     Write-Log "Mounting ISO..." -Level STEP
     try {
         $mountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru
@@ -567,24 +583,22 @@ function Build-IsoUsb {
     }
 
     try {
-        # Copy all ISO contents to USB
-        Write-Log "Copying ISO contents to USB $UsbLetter (this takes a few minutes)..." -Level STEP
-        $roboCopy = & robocopy.exe "$isoDrive\" "$UsbLetter\" /E /NFL /NDL /NJH /NJS 2>&1
+        Write-Log "Copying ISO contents to USB $UsbLetter (this may take several minutes)..." -Level STEP
+        & robocopy.exe "$isoDrive\" "$UsbLetter\" /E /NFL /NDL /NJH /NJS 2>&1 | Out-Null
         Write-Log "robocopy exit: $LASTEXITCODE (0-7 = OK)" -Level INFO
 
         Copy-ToolkitToUsb -UsbLetter $UsbLetter
 
-        # Run bootsect for BIOS compatibility
         $bootsect = "$isoDrive\boot\bootsect.exe"
         if (Test-Path $bootsect) {
             Write-Log "Running bootsect for BIOS boot support..." -Level STEP
-            & $bootsect /nt60 "$UsbLetter" /force /mbr 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
+            & $bootsect /nt60 "$UsbLetter" /force /mbr 2>&1 |
+                ForEach-Object { Write-Log "  $_" -Level INFO }
         }
 
         Write-Log "ISO USB creation complete!" -Level SUCCESS
         return $true
     } finally {
-        # Always unmount ISO
         try { Dismount-DiskImage -ImagePath $IsoPath | Out-Null } catch {}
         Write-Log "ISO unmounted." -Level INFO
     }
@@ -594,57 +608,54 @@ function Build-IsoUsb {
 # SECTION 7: COPY TOOLKIT TO USB
 # ============================================================
 function Copy-ToolkitToUsb {
-    <#
-    .SYNOPSIS Copies boot-repair.ps1 and boot-repair.cmd to the USB root.
-    #>
     param([string]$UsbLetter)
 
     Write-Log "Copying winboot-rescue toolkit to USB root..." -Level STEP
 
-    $toolFiles = @('boot-repair.ps1', 'boot-repair.cmd')
     $anyMissing = $false
-
-    foreach ($f in $toolFiles) {
+    foreach ($f in @('boot-repair.ps1', 'boot-repair.cmd')) {
         $src  = Join-Path $Script:ToolkitDir $f
         $dest = Join-Path $UsbLetter $f
 
         if (Test-Path $src) {
             Copy-Item $src $dest -Force
-            Write-Log "  Copied: $f -> $UsbLetter\$f" -Level SUCCESS
+            Write-Log "  Copied: $f" -Level SUCCESS
         } else {
             Write-Log "  NOT FOUND: $f (expected at $src)" -Level WARN
             $anyMissing = $true
         }
     }
 
-    # Create a README on the USB
     $readmeContent = @"
 WINBOOT-RESCUE TOOLKIT
 ======================
 
 Files on this USB:
-  boot-repair.cmd  <- Launch this from WinRE command prompt
+  boot-repair.cmd  <- Launch this from WinRE/WinPE command prompt
   boot-repair.ps1  <- Main PowerShell script
 
 HOW TO USE:
   1. Boot from this USB (change boot order in BIOS/UEFI)
   2. When WinRE/WinPE loads, open Command Prompt
-  3. Find this USB drive letter (usually NOT C:)
+  3. Find this USB drive letter:
      > diskpart
      > list volume
      > exit
-  4. Navigate to this USB and run:
+  4. Navigate to USB and run:
      > E:\boot-repair.cmd   (replace E: with your USB letter)
   5. Choose option [1] first to collect diagnostics
   6. Then choose [2] or [4]/[5] based on your system type
+
+  If injected into WinPE image, also available at:
+     X:\Windows\System32\winboot-rescue\boot-repair.cmd
 
 FIRST TIME: Always run option [1] (diagnostics) before attempting repair.
 
 GitHub: https://github.com/Gzeu/winboot-rescue
 "@
-    $readmeDest = Join-Path $UsbLetter 'README-BOOT-REPAIR.txt'
-    Set-Content -Path $readmeDest -Value $readmeContent -Encoding UTF8 -ErrorAction SilentlyContinue
-    Write-Log "  Created README-BOOT-REPAIR.txt on USB." -Level INFO
+    Set-Content -Path (Join-Path $UsbLetter 'README-BOOT-REPAIR.txt') `
+        -Value $readmeContent -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-Log "  Created README-BOOT-REPAIR.txt" -Level INFO
 
     if (-not $anyMissing) {
         Write-Log "All toolkit files copied to USB." -Level SUCCESS
@@ -655,9 +666,6 @@ GitHub: https://github.com/Gzeu/winboot-rescue
 # SECTION 8: VERIFY USB
 # ============================================================
 function Test-UsbBoot {
-    <#
-    .SYNOPSIS Verifies the USB has required boot files.
-    #>
     param([string]$UsbLetter)
 
     Write-Log "Verifying USB boot files..." -Level SECTION
@@ -680,7 +688,7 @@ function Test-UsbBoot {
     }
 
     if ($allGood) {
-        Write-Log "USB verification passed. Drive is ready." -Level SUCCESS
+        Write-Log "USB verification passed. Drive appears ready." -Level SUCCESS
     } else {
         Write-Log "USB verification: some required files missing. USB may not boot correctly." -Level WARN
     }
@@ -692,17 +700,26 @@ function Test-UsbBoot {
 # SECTION 9: MAIN MENU
 # ============================================================
 function Show-Menu {
-    $adkRoot = Find-AdkPath
-    $hasAdk  = $null -ne $adkRoot
+    $adkInfo = Find-AdkPath
+    $hasAdk  = $null -ne $adkInfo
+    $hasCopype = $hasAdk -and $null -ne $adkInfo.CopypePath
 
     Write-Host "`n$('='*60)" -ForegroundColor White
     Write-Host "  WINBOOT-RESCUE -- USB CREATOR" -ForegroundColor Cyan
     Write-Host "$('='*60)" -ForegroundColor White
-    Write-Host "  ADK installed: $(if ($hasAdk) {'YES -- Mode A available'} else {'NO -- Mode A unavailable'})" `
-        -ForegroundColor $(if ($hasAdk) {'Green'} else {'Yellow'})
+
+    if ($hasAdk -and $hasCopype) {
+        Write-Host "  ADK installed: YES -- Mode A available" -ForegroundColor Green
+    } elseif ($hasAdk -and -not $hasCopype) {
+        Write-Host "  ADK installed: YES -- but WinPE Add-on MISSING (Mode A unavailable)" -ForegroundColor Yellow
+        Write-Host "  Install Add-on: https://learn.microsoft.com/windows-hardware/get-started/adk-install" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  ADK installed: NO -- Mode A unavailable" -ForegroundColor Yellow
+    }
+
     Write-Host "$('-'*60)" -ForegroundColor DarkGray
-    Write-Host "  [1] Mode A -- WinPE USB from ADK (best, full WinPE)$(if (-not $hasAdk){' [ADK required]'})" `
-        -ForegroundColor $(if ($hasAdk) {'Green'} else {'DarkGray'})
+    $modeAColor = if ($hasCopype) { 'Green' } else { 'DarkGray' }
+    Write-Host "  [1] Mode A -- WinPE USB from ADK (best, full WinPE)$(if (-not $hasCopype){' [WinPE Add-on required]'})" -ForegroundColor $modeAColor
     Write-Host "  [2] Mode B -- WinRE USB from local machine (no ADK needed)" -ForegroundColor Cyan
     Write-Host "  [3] Mode C -- USB from Windows ISO file" -ForegroundColor Cyan
     Write-Host "  [4] Only copy toolkit to existing bootable USB" -ForegroundColor Yellow
@@ -715,63 +732,70 @@ function Show-Menu {
 
     switch ($choice) {
         '1' {
-            if (-not $hasAdk) {
-                Write-Log "ADK not installed. Download from: https://learn.microsoft.com/windows-hardware/get-started/adk-install" -Level ERROR
-                Write-Host "`n  Download ADK + WinPE Add-on from Microsoft, then re-run." -ForegroundColor Yellow
-                return
+            if (-not $hasCopype) {
+                Write-Log "WinPE Add-on not installed. Mode A unavailable." -Level ERROR
+                Write-Host "`n  Download and install the WinPE Add-on for ADK from:" -ForegroundColor Yellow
+                Write-Host "  https://learn.microsoft.com/windows-hardware/get-started/adk-install" -ForegroundColor Yellow
+            } else {
+                $usb = Select-UsbDrive
+                if ($usb) {
+                    $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
+                    if ($usbLetter) {
+                        Build-WinPeUsb -UsbLetter $usbLetter -AdkInfo $adkInfo | Out-Null
+                        Test-UsbBoot   -UsbLetter $usbLetter | Out-Null
+                    }
+                }
             }
-            $usb = Select-UsbDrive
-            if (-not $usb) { return }
-            $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
-            if (-not $usbLetter) { return }
-            Build-WinPeUsb -UsbLetter $usbLetter -AdkRoot $adkRoot
-            Test-UsbBoot -UsbLetter $usbLetter
         }
         '2' {
             $usb = Select-UsbDrive
-            if (-not $usb) { return }
-            $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
-            if (-not $usbLetter) { return }
-            Build-WinReUsb -UsbLetter $usbLetter
-            Test-UsbBoot -UsbLetter $usbLetter
+            if ($usb) {
+                $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
+                if ($usbLetter) {
+                    Build-WinReUsb -UsbLetter $usbLetter | Out-Null
+                    Test-UsbBoot   -UsbLetter $usbLetter | Out-Null
+                }
+            }
         }
         '3' {
-            $isoPath = Read-Host "Enter full path to Windows ISO file"
-            $isoPath = $isoPath.Trim('"')
-            if (-not (Test-Path $isoPath)) {
+            $isoPath = (Read-Host "Enter full path to Windows ISO file").Trim('"')
+            if (Test-Path $isoPath) {
+                $usb = Select-UsbDrive
+                if ($usb) {
+                    $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
+                    if ($usbLetter) {
+                        Build-IsoUsb -UsbLetter $usbLetter -IsoPath $isoPath | Out-Null
+                        Test-UsbBoot -UsbLetter $usbLetter | Out-Null
+                    }
+                }
+            } else {
                 Write-Log "ISO not found: $isoPath" -Level ERROR
-                return
             }
-            $usb = Select-UsbDrive
-            if (-not $usb) { return }
-            $usbLetter = Format-UsbDrive -PartitionStyle 'MBR'
-            if (-not $usbLetter) { return }
-            Build-IsoUsb -UsbLetter $usbLetter -IsoPath $isoPath
-            Test-UsbBoot -UsbLetter $usbLetter
         }
         '4' {
-            $letter = Read-Host "Enter existing USB drive letter (e.g. E)"
+            $letter    = Read-Host "Enter existing USB drive letter (e.g. E)"
             $usbLetter = "$($letter.Trim(':')):"
-            if (-not (Test-Path $usbLetter)) {
+            if (Test-Path $usbLetter) {
+                Copy-ToolkitToUsb -UsbLetter $usbLetter
+                Test-UsbBoot      -UsbLetter $usbLetter | Out-Null
+            } else {
                 Write-Log "Drive $usbLetter not found." -Level ERROR
-                return
             }
-            Copy-ToolkitToUsb -UsbLetter $usbLetter
-            Test-UsbBoot -UsbLetter $usbLetter
         }
         '5' {
-            $letter = Read-Host "Enter USB drive letter to verify (e.g. E)"
+            $letter    = Read-Host "Enter USB drive letter to verify (e.g. E)"
             $usbLetter = "$($letter.Trim(':')):"
-            Test-UsbBoot -UsbLetter $usbLetter
+            Test-UsbBoot -UsbLetter $usbLetter | Out-Null
         }
-        '0' { return }
-        default { Write-Host "  Invalid option." -ForegroundColor Red }
+        '0' {
+            Write-Log "User exited." -Level INFO
+            return
+        }
+        default { Write-Host "  Invalid option. Enter 0-5." -ForegroundColor Red }
     }
 
-    # Show log location
     Write-Host "`n[INFO] Log file: $Script:LogFile" -ForegroundColor DarkGray
-    Write-Host "Press any key to return to menu..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    Wait-KeyPress 'Press Enter to return to menu...'
     Show-Menu
 }
 
@@ -793,18 +817,17 @@ $('='*60)
 
     Initialize-WorkDir
 
-    # Check admin
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         Write-Log "Not running as Administrator! Re-launch as Admin." -Level ERROR
         Write-Host "`nRight-click the script and choose 'Run as administrator'" -ForegroundColor Yellow
-        Read-Host "Press Enter to exit"
+        Read-Host "Press Enter to exit" | Out-Null
         exit 1
     }
 
-    Write-Log "Script directory: $Script:ToolkitDir"
-    Write-Log "Checking for toolkit files..."
+    Write-Log "Script directory: $Script:ToolkitDir" -Level INFO
+    Write-Log "Checking for toolkit files..." -Level INFO
 
     foreach ($f in @('boot-repair.ps1','boot-repair.cmd')) {
         $path = Join-Path $Script:ToolkitDir $f
@@ -819,6 +842,8 @@ $('='*60)
     Show-Menu
 
     Write-Log "Session ended: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level INFO
+    Write-Host "`nDone. Log saved to: $Script:LogFile" -ForegroundColor Green
+    Wait-KeyPress 'Press Enter to exit...'
 }
 
 Main
