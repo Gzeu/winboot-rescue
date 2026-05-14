@@ -2,7 +2,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    make-bootable-usb.ps1 — Creates a bootable WinPE/WinRE USB stick and copies
+    make-bootable-usb.ps1 -- Creates a bootable WinPE/WinRE USB stick and copies
     the winboot-rescue toolkit onto it automatically.
 
 .DESCRIPTION
@@ -20,15 +20,15 @@
 .NOTES
     === REQUIREMENTS ===
     - Must run as Administrator
-    - Windows 10/11 host (not WinPE — run this on a working PC)
+    - Windows 10/11 host (not WinPE -- run this on a working PC)
     - A USB drive of at least 1 GB (4 GB+ recommended for WinPE ADK)
     - To use the ADK path: Windows ADK + WinPE Add-on must be installed
       Download: https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install
 
     === MODES ===
-    Mode A — ADK/WinPE (full WinPE environment, best)
-    Mode B — WinRE copy from local machine (no ADK needed, uses existing WinRE)
-    Mode C — WinRE ISO mount (if you have a Windows ISO)
+    Mode A -- ADK/WinPE (full WinPE environment, best)
+    Mode B -- WinRE copy from local machine (no ADK needed, uses existing WinRE)
+    Mode C -- WinRE ISO mount (if you have a Windows ISO)
 
     COMPAT  : Windows 10/11 (x64), run from standard Windows session
     AUTHOR  : winboot-rescue toolkit
@@ -131,7 +131,7 @@ function Select-UsbDrive {
 
     for ($i = 0; $i -lt $usbs.Count; $i++) {
         $u = $usbs[$i]
-        Write-Host "  [$($i+1)] Disk $($u.DiskNumber) — $($u.Model) — $($u.SizeGB) GB — Letters: $(if ($u.Letters) {$u.Letters} else {'(none)'})" -ForegroundColor Cyan
+        Write-Host "  [$($i+1)] Disk $($u.DiskNumber) -- $($u.Model) -- $($u.SizeGB) GB -- Letters: $(if ($u.Letters) {$u.Letters} else {'(none)'})" -ForegroundColor Cyan
     }
     Write-Host ""
 
@@ -142,9 +142,9 @@ function Select-UsbDrive {
     } while ($idx -lt 0 -or $idx -ge $usbs.Count)
 
     $selected = $usbs[$idx]
-    Write-Log "User selected: Disk $($selected.DiskNumber) — $($selected.Model) — $($selected.SizeGB) GB" -Level SUCCESS
+    Write-Log "User selected: Disk $($selected.DiskNumber) -- $($selected.Model) -- $($selected.SizeGB) GB" -Level SUCCESS
 
-    Write-Host "`n[CONFIRM] You selected: Disk $($selected.DiskNumber) — $($selected.Model) — $($selected.SizeGB) GB" -ForegroundColor Yellow
+    Write-Host "`n[CONFIRM] You selected: Disk $($selected.DiskNumber) -- $($selected.Model) -- $($selected.SizeGB) GB" -ForegroundColor Yellow
     Write-Host "          ALL DATA WILL BE PERMANENTLY ERASED." -ForegroundColor Red
     $confirm = Read-Host "Type YES (uppercase) to confirm"
     if ($confirm -ne 'YES') {
@@ -188,7 +188,7 @@ assign
 active
 "@
     } else {
-        # MBR — most compatible (boots on BIOS and most UEFI with CSM)
+        # MBR -- most compatible (boots on BIOS and most UEFI with CSM)
         $dpScript = @"
 select disk $diskNum
 clean
@@ -210,7 +210,7 @@ active
     Remove-Item $dpFile -Force -ErrorAction SilentlyContinue
 
     if ($exitCode -ne 0) {
-        Write-Log "diskpart exited with code $exitCode — format may have failed." -Level WARN
+        Write-Log "diskpart exited with code $exitCode -- format may have failed." -Level WARN
     } else {
         Write-Log "Disk $diskNum formatted successfully as $PartitionStyle/FAT32." -Level SUCCESS
     }
@@ -301,7 +301,7 @@ function Find-WinPeAddon {
 }
 
 # ============================================================
-# SECTION 4: MODE A — ADK WinPE BUILD
+# SECTION 4: MODE A -- ADK WinPE BUILD
 # ============================================================
 function Build-WinPeUsb {
     <#
@@ -328,7 +328,7 @@ function Build-WinPeUsb {
 
     $wpeWim = Join-Path $wpePe 'media\sources\boot.wim'
     if (-not (Test-Path $wpeWim)) {
-        Write-Log "copype failed — boot.wim not found at $wpeWim" -Level ERROR
+        Write-Log "copype failed -- boot.wim not found at $wpeWim" -Level ERROR
         return $false
     }
     Write-Log "copype completed. boot.wim: $wpeWim" -Level SUCCESS
@@ -354,25 +354,12 @@ function Build-WinPeUsb {
                 Copy-Item $src $peToolDir -Force
                 Write-Log "  Injected $f into WinPE image." -Level SUCCESS
             } else {
-                Write-Log "  $f not found in $Script:ToolkitDir — skipping injection." -Level WARN
+                Write-Log "  $f not found in $Script:ToolkitDir -- skipping injection." -Level WARN
             }
         }
 
-        # Create an autostart hint file on the WinPE desktop
+        # Append boot hint to startnet.cmd (wpeinit must stay first)
         $startupHint = Join-Path $mountDir 'Windows\System32\startnet.cmd'
-        $hintContent = @"
-@echo off
-wpeinit
-echo.
-echo  ============================================
-echo   winboot-rescue toolkit is available at:
-echo   X:\Windows\System32\winboot-rescue\
-echo   Run: boot-repair.cmd
-echo  ============================================
-echo.
-cmd.exe /k
-"@
-        # Append to existing startnet.cmd (wpeinit must stay first)
         try {
             $existing = Get-Content $startupHint -ErrorAction SilentlyContinue
             if ($existing -notmatch 'winboot-rescue') {
@@ -388,7 +375,7 @@ cmd.exe /k
         if ($LASTEXITCODE -eq 0) {
             Write-Log "WinPE image customized and committed." -Level SUCCESS
         } else {
-            Write-Log "DISM unmount had errors — image may still work." -Level WARN
+            Write-Log "DISM unmount had errors -- image may still work." -Level WARN
         }
     }
 
@@ -398,15 +385,14 @@ cmd.exe /k
     $copyResult = & robocopy.exe "$mediaDir" "$UsbLetter\" /E /NFL /NDL /NJH /NJS 2>&1
     Write-Log "robocopy exit: $LASTEXITCODE (0-7 = OK)" -Level INFO
 
-    # Make USB bootable (bcdboot not needed for ADK — media already has boot sector)
-    # But we run it anyway for safety on MBR USB
+    # Run bcdboot for safety on MBR USB
     $windowsDir = Join-Path $UsbLetter 'Windows'
     if (Test-Path $windowsDir) {
         Write-Log "Running bcdboot to ensure boot sector..." -Level STEP
         & bcdboot.exe "$windowsDir" /s "$UsbLetter" /f ALL 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
     }
 
-    # Also copy toolkit to USB root for easy access
+    # Copy toolkit to USB root for easy access
     Copy-ToolkitToUsb -UsbLetter $UsbLetter
 
     Write-Log "WinPE USB creation complete!" -Level SUCCESS
@@ -414,7 +400,7 @@ cmd.exe /k
 }
 
 # ============================================================
-# SECTION 5: MODE B — WinRE from local machine
+# SECTION 5: MODE B -- WinRE from local machine
 # ============================================================
 function Build-WinReUsb {
     <#
@@ -469,7 +455,7 @@ function Build-WinReUsb {
 
         & dism.exe /Unmount-Image /MountDir:"$mountDir" /Commit 2>&1 | ForEach-Object { Write-Log "  $_" -Level INFO }
     } else {
-        Write-Log "Could not mount WinRE.wim for injection — toolkit will be on USB root instead." -Level WARN
+        Write-Log "Could not mount WinRE.wim for injection -- toolkit will be on USB root instead." -Level WARN
         & dism.exe /Unmount-Image /MountDir:"$mountDir" /Discard 2>&1 | Out-Null
     }
 
@@ -491,7 +477,7 @@ function Build-WinReUsb {
     if ($LASTEXITCODE -eq 0) {
         Write-Log "bcdboot completed successfully." -Level SUCCESS
     } else {
-        Write-Log "bcdboot returned $LASTEXITCODE — USB may still boot but verify." -Level WARN
+        Write-Log "bcdboot returned $LASTEXITCODE -- USB may still boot but verify." -Level WARN
     }
 
     # Bootsect for MBR/BIOS compatibility
@@ -543,7 +529,7 @@ function Find-WinReWim {
 }
 
 # ============================================================
-# SECTION 6: MODE C — Windows ISO
+# SECTION 6: MODE C -- Windows ISO
 # ============================================================
 function Build-IsoUsb {
     <#
@@ -622,7 +608,7 @@ function Copy-ToolkitToUsb {
         }
     }
 
-    # Create a README shortcut on the USB
+    # Create a README on the USB
     $readmeContent = @"
 WINBOOT-RESCUE TOOLKIT
 ======================
@@ -701,15 +687,15 @@ function Show-Menu {
     $hasAdk  = $null -ne $adkRoot
 
     Write-Host "`n$('='*60)" -ForegroundColor White
-    Write-Host "  WINBOOT-RESCUE — USB CREATOR" -ForegroundColor Cyan
+    Write-Host "  WINBOOT-RESCUE -- USB CREATOR" -ForegroundColor Cyan
     Write-Host "$('='*60)" -ForegroundColor White
-    Write-Host "  ADK installed: $(if ($hasAdk) {'YES — Mode A available'} else {'NO — Mode A unavailable'})" `
+    Write-Host "  ADK installed: $(if ($hasAdk) {'YES -- Mode A available'} else {'NO -- Mode A unavailable'})" `
         -ForegroundColor $(if ($hasAdk) {'Green'} else {'Yellow'})
     Write-Host "$('-'*60)" -ForegroundColor DarkGray
-    Write-Host "  [1] Mode A — WinPE USB from ADK (best, full WinPE)$(if (-not $hasAdk){' [ADK required]'})" `
+    Write-Host "  [1] Mode A -- WinPE USB from ADK (best, full WinPE)$(if (-not $hasAdk){' [ADK required]'})" `
         -ForegroundColor $(if ($hasAdk) {'Green'} else {'DarkGray'})
-    Write-Host "  [2] Mode B — WinRE USB from local machine (no ADK needed)" -ForegroundColor Cyan
-    Write-Host "  [3] Mode C — USB from Windows ISO file" -ForegroundColor Cyan
+    Write-Host "  [2] Mode B -- WinRE USB from local machine (no ADK needed)" -ForegroundColor Cyan
+    Write-Host "  [3] Mode C -- USB from Windows ISO file" -ForegroundColor Cyan
     Write-Host "  [4] Only copy toolkit to existing bootable USB" -ForegroundColor Yellow
     Write-Host "  [5] Verify existing USB" -ForegroundColor White
     Write-Host "  [0] Exit" -ForegroundColor Red
@@ -788,7 +774,7 @@ function Main {
 
     Write-Host @"
 $('='*60)
-  WINBOOT-RESCUE — USB STICK CREATOR
+  WINBOOT-RESCUE -- USB STICK CREATOR
   Creates a bootable WinPE/WinRE USB with boot-repair toolkit
 $('='*60)
   !! Run as Administrator !!
