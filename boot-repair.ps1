@@ -10,6 +10,7 @@
     - Missing/unconfigured EFI System Partition
     - Corrupt MBR/boot sector (Legacy BIOS)
     - Missing or damaged boot files
+    - Corrupt system image (via DISM offline repair)
 
 .NOTES
     === WinRE/WinPE LIMITATIONS ===
@@ -19,8 +20,9 @@
     - Drive letters are assigned dynamically in WinPE; C: is NOT assumed
     - Some bootrec operations (fixboot) may fail with "Access is denied" on UEFI systems - handled explicitly
     - Transcript may fail if the log path is on a read-only volume
+    - DISM /RestoreHealth requires a valid Windows source (WIM/ESD or Windows Update)
 
-    AUTHOR  : Boot Repair Utility v2.0
+    AUTHOR  : Boot Repair Utility v2.1
     COMPAT  : Windows 10/11 WinRE / WinPE (x64)
     USAGE   : Launch via boot-repair.cmd wrapper, or:
               powershell.exe -ExecutionPolicy Bypass -File boot-repair.ps1
@@ -47,6 +49,7 @@ $Script:EfiTempLetter  = $null   # If we assigned a temp letter, store it here f
 $Script:SystemDisk     = $null   # Disk number hosting Windows
 $Script:DiagComplete   = $false
 $Script:RepairDone     = $false
+$Script:WimSourcePath  = $null   # Optional: path to install.wim/esd for DISM source
 
 # ============================================================
 # SECTION 1: LOGGING INFRASTRUCTURE
@@ -71,7 +74,7 @@ function Initialize-Logging {
 
         try { Start-Transcript -Path $Script:TranscriptPath -Append | Out-Null } catch { <# transcript not critical #> }
 
-        Write-Log "=== Windows Boot Repair Utility v2.0 ==="
+        Write-Log "=== Windows Boot Repair Utility v2.1 ==="
         Write-Log "Session started: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         Write-Log "Script location: $($Script:ScriptDrive)"
         Write-Log "Log directory:   $($Script:LogDir)"
@@ -223,6 +226,16 @@ function Get-Environment {
     Write-Log "PowerShell version: $($PSVersionTable.PSVersion)"
     Write-Log "OS version: $([System.Environment]::OSVersion.VersionString)"
 
+    # Auto-detect WIM source on the USB stick (sources\install.wim / install.esd)
+    foreach ($wimName in @('install.wim','install.esd','sources\install.wim','sources\install.esd')) {
+        $wimCandidate = Join-Path $Script:ScriptDrive $wimName
+        if (Test-Path $wimCandidate -ErrorAction SilentlyContinue) {
+            $Script:WimSourcePath = $wimCandidate
+            Write-Log "  Found WIM/ESD source on USB: $wimCandidate" -Level SUCCESS
+            break
+        }
+    }
+
     return [PSCustomObject]@{
         IsWinPE = $isWinPE
         IsWinRE = $isWinRE
@@ -251,13 +264,14 @@ function Get-BootMode {
         }
     } catch {}
 
+    # Most reliable: Win32 GetFirmwareEnvironmentVariableA
+    # Error 998 (ERROR_NOACCESS) = UEFI present, Error 1 (ERROR_INVALID_FUNCTION) = BIOS only
     try {
         $sig = '[DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetFirmwareEnvironmentVariableA(string lpName, string lpGuid, System.IntPtr pBuffer, uint nSize);'
         $type = Add-Type -MemberDefinition $sig -Name 'FirmwareCheck' -Namespace 'Win32' -PassThru -ErrorAction SilentlyContinue
         if ($type) {
-            $result = $type::GetFirmwareEnvironmentVariableA('', '{00000000-0000-0000-0000-000000000000}', [System.IntPtr]::Zero, 0)
+            $null = $type::GetFirmwareEnvironmentVariableA('', '{00000000-0000-0000-0000-000000000000}', [System.IntPtr]::Zero, 0)
             $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            # Error 998 (ERROR_NOACCESS) = UEFI, Error 1 (ERROR_INVALID_FUNCTION) = BIOS
             if ($err -eq 998) { $bootMode = 'UEFI' }
             elseif ($err -eq 1) { $bootMode = 'BIOS' }
         }
@@ -275,6 +289,7 @@ function Get-BootMode {
 function Get-DiskInventory {
     <#
     .SYNOPSIS Enumerates all disks, volumes, and identifies partition style.
+    .NOTES Also detects NVMe drives and warns if StorNVMe driver may be missing in WinPE.
     #>
     Write-Log "Enumerating disks and volumes..." -Level SECTION
 
@@ -308,6 +323,13 @@ function Get-DiskInventory {
                     Partitions        = $volumes
                 }
                 $disks += $diskObj
+
+                # NVMe detection: warn if WinPE may lack driver
+                if ($disk.FriendlyName -match 'NVMe|NVME') {
+                    Write-Log "  [NVMe] Detected NVMe drive: $($disk.FriendlyName)" -Level WARN
+                    Write-Log "  [NVMe] If Windows cannot be found, your WinPE may lack the NVMe/StorNVMe driver." -Level WARN
+                }
+
                 Write-Log "  Disk $($disk.DiskNumber): $($disk.FriendlyName) | $($disk.PartitionStyle) | $([math]::Round($disk.Size/1GB,1)) GB | $($disk.OperationalStatus)"
                 foreach ($v in $volumes) {
                     $letter = if ($v.DriveLetter) { "$($v.DriveLetter):" } else { '(no letter)' }
@@ -342,8 +364,8 @@ function Get-DiskInventory {
     $dpScript = "list disk`r`nlist volume`r`nlist partition"
     $dpFile    = Join-Path $env:TEMP 'dp_list.txt'
     $dpScript | Set-Content $dpFile -Encoding ASCII -ErrorAction SilentlyContinue
-    $dpResult  = Invoke-LoggedCommand -Command 'diskpart' -Arguments @("/s", $dpFile) `
-                    -Description "diskpart list disk/vol/partition" -SaveRawAs "diskpart_list.txt" -IgnoreExit
+    Invoke-LoggedCommand -Command 'diskpart' -Arguments @("/s", $dpFile) `
+        -Description "diskpart list disk/vol/partition" -SaveRawAs "diskpart_list.txt" -IgnoreExit | Out-Null
     Remove-Item $dpFile -Force -ErrorAction SilentlyContinue
 
     return $disks
@@ -367,8 +389,13 @@ function Get-EfiPartition {
     $efiGuid = '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
 
     try {
+        # Only look on the same disk as the selected Windows installation if known
         $allDisks = Get-Disk -ErrorAction SilentlyContinue
-        foreach ($disk in $allDisks) {
+        $searchDisks = if ($Script:SystemDisk -ne $null) {
+            $allDisks | Where-Object { $_.DiskNumber -eq $Script:SystemDisk }
+        } else { $allDisks }
+
+        foreach ($disk in $searchDisks) {
             $parts = Get-Partition -DiskNumber $disk.DiskNumber -ErrorAction SilentlyContinue
             foreach ($p in $parts) {
                 $gpt = "$($p.GptType)".ToLower()
@@ -446,7 +473,7 @@ function Get-AvailableDriveLetter {
     .SYNOPSIS Returns the first unused drive letter (starting from S to avoid common conflicts).
     #>
     $used = [System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name[0] }
-    foreach ($l in @('S','T','U','V','W','X','Y','Z','R','Q','P','O','N','M','L','K','J','I')) {
+    foreach ($l in @('S','T','U','V','W','R','Q','P','O','N','M','L','K','J','I')) {
         if ($l -notin $used) { return $l }
     }
     return $null
@@ -512,6 +539,12 @@ function Get-WindowsInstallations {
             $winBootType = if ($hasWinload -and (Test-Path $winloadEfi -ErrorAction SilentlyContinue)) { 'UEFI' }
                            elseif ($hasWinload) { 'BIOS' }
                            else { 'Unknown' }
+
+            # Track which disk this installation lives on
+            try {
+                $driveObj = Get-Partition | Where-Object { $_.DriveLetter -eq $drive[0] } | Select-Object -First 1
+                if ($driveObj) { $Script:SystemDisk = $driveObj.DiskNumber }
+            } catch {}
 
             $install = [PSCustomObject]@{
                 Drive         = $drive
@@ -595,6 +628,13 @@ function Collect-Diagnostics {
     Invoke-LoggedCommand -Command 'reagentc' -Arguments @('/info') `
         -Description "Windows Recovery Agent info" -SaveRawAs "reagentc_info.txt" -IgnoreExit | Out-Null
 
+    # DISM image health check (informational, non-destructive)
+    if ($Script:SelectedWin) {
+        Invoke-LoggedCommand -Command 'dism' `
+            -Arguments @('/Image:'+$Script:SelectedWin.Drive, '/Get-Intl') `
+            -Description "DISM get locale info for selected install" -SaveRawAs "dism_intl.txt" -IgnoreExit | Out-Null
+    }
+
     try {
         $logicalDisks = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue |
             Select-Object DeviceID, DriveType, Size, FreeSpace, FileSystem, VolumeName |
@@ -636,13 +676,19 @@ function Show-DiagnosticSummary {
     Write-Host "$('='*60)" -ForegroundColor White
     Write-Host "  Firmware mode:       $Script:BootMode" -ForegroundColor $(if ($Script:BootMode) {'Green'} else {'Red'})
     Write-Host "  Partition style:     $Script:PartStyle" -ForegroundColor $(if ($Script:PartStyle) {'Green'} else {'Yellow'})
-    Write-Host "  EFI drive letter:    $(if ($Script:EfiDrive) {$Script:EfiDrive+':'} else {'Not assigned / Not found'})" -ForegroundColor $(if ($Script:EfiDrive) {'Green'} else {'Yellow'})
-    Write-Host "  Windows found:       $($Script:WinInstalls.Count)" -ForegroundColor $(if ($Script:WinInstalls.Count -gt 0) {'Green'} else {'Red'})
-
+    Write-Host "  EFI drive letter:    $(if ($Script:EfiDrive) {$Script:EfiDrive+':'} else {'Not assigned / Not found'})" `
+        -ForegroundColor $(if ($Script:EfiDrive) {'Green'} else {'Yellow'})
+    Write-Host "  Windows found:       $($Script:WinInstalls.Count)" `
+        -ForegroundColor $(if ($Script:WinInstalls.Count -gt 0) {'Green'} else {'Red'})
     if ($Script:SelectedWin) {
-        Write-Host "  Selected install:    $($Script:SelectedWin.Drive)\ | $($Script:SelectedWin.Version)" -ForegroundColor Green
+        Write-Host "  Selected install:    $($Script:SelectedWin.Drive)\ | $($Script:SelectedWin.Version) | Build $($Script:SelectedWin.Build)" -ForegroundColor Green
     }
-
+    if ($Script:WimSourcePath) {
+        Write-Host "  WIM/ESD source:      $Script:WimSourcePath" -ForegroundColor Green
+    } else {
+        Write-Host "  WIM/ESD source:      Not found on USB (DISM /RestoreHealth will use Windows Update if available)" -ForegroundColor Yellow
+    }
+    Write-Host "  Log directory:       $Script:LogDir" -ForegroundColor DarkGray
     Write-Host "$('='*60)`n" -ForegroundColor White
 }
 
@@ -704,6 +750,7 @@ function Repair-UefiBoot {
     <#
     .SYNOPSIS Repairs the UEFI boot environment for a GPT system.
     .NOTES Uses bcdboot as primary tool. bootrec /fixboot is NOT used on UEFI (returns Access Denied).
+           Attempts /locale en-US to prevent locale-mismatch boot failures.
     #>
     Write-Log "Starting UEFI/GPT boot repair..." -Level SECTION
 
@@ -719,7 +766,8 @@ function Repair-UefiBoot {
     if (-not $efiInfo.Found) {
         Write-Log "EFI System Partition not found. Cannot perform UEFI boot repair." -Level ERROR
         Write-Log "  -> The EFI partition may be missing, deleted, or damaged." -Level ERROR
-        Write-Log "  -> If you have a backup, restore it. Otherwise consider recreating it." -Level ERROR
+        Write-Log "  -> If disk is GPT, consider recreating EFI partition manually with diskpart." -Level ERROR
+        Write-Log "  -> Alternatively, convert to MBR and use BIOS repair (destructive, not recommended)." -Level ERROR
         return $false
     }
 
@@ -748,10 +796,11 @@ function Repair-UefiBoot {
 
     Backup-BcdStore | Out-Null
 
-    Write-Log "Running: bcdboot $winDir /s $efiLetter`: /f UEFI" -Level STEP
+    # Primary: bcdboot with explicit UEFI and locale (avoids locale mismatch boot failures)
+    Write-Log "Running: bcdboot $winDir /s $efiLetter`: /f UEFI /l en-us" -Level STEP
     $bcdbootResult = Invoke-LoggedCommand -Command 'bcdboot' `
-        -Arguments @($winDir, '/s', "$efiLetter`:", '/f', 'UEFI') `
-        -Description "bcdboot UEFI (primary)" -SaveRawAs "bcdboot_uefi.txt" -IgnoreExit
+        -Arguments @($winDir, '/s', "$efiLetter`:", '/f', 'UEFI', '/l', 'en-us') `
+        -Description "bcdboot UEFI /l en-us (primary)" -SaveRawAs "bcdboot_uefi.txt" -IgnoreExit
 
     if ($bcdbootResult.Success) {
         Write-Log "bcdboot UEFI completed successfully." -Level SUCCESS
@@ -774,15 +823,14 @@ function Repair-UefiBoot {
     }
 
     if (Test-Path "$efiBootPath\BCD" -ErrorAction SilentlyContinue) {
-        Write-Log "BCD file created despite non-zero exit code. Boot may be repaired." -Level WARN
+        Write-Log "BCD file present despite non-zero exit code. Boot may be repaired." -Level WARN
         $Script:RepairDone = $true
         Remove-TempEfiLetter
         return $true
     }
 
     Write-Log "NOTE: 'bootrec /fixboot' is NOT used here intentionally." -Level INFO
-    Write-Log "  On UEFI systems, bootrec /fixboot typically returns 'Access is denied'" -Level INFO
-    Write-Log "  because it targets the MBR/VBR which does not exist in pure UEFI mode." -Level INFO
+    Write-Log "  On UEFI systems, bootrec /fixboot returns 'Access is denied' - this is expected." -Level INFO
     Write-Log "  bcdboot is the correct tool for UEFI boot file repair." -Level INFO
 
     Write-Log "UEFI boot repair failed. Manual intervention may be required." -Level ERROR
@@ -831,7 +879,7 @@ function Repair-BiosBoot {
         -Description "bootrec /fixboot" -SaveRawAs "bootrec_fixboot.txt" -IgnoreExit
     $fixbootOut = ($r.Output -join ' ').ToLower()
     if ($fixbootOut -match 'access is denied') {
-        Write-Log "  bootrec /fixboot returned 'Access is denied' - this is normal on UEFI. Continuing..." -Level WARN
+        Write-Log "  bootrec /fixboot returned 'Access is denied' - normal on UEFI. Continuing..." -Level WARN
     } elseif (-not $r.Success) {
         $allSuccess = $false
         Write-Log "  bootrec /fixboot failed with exit code $($r.ExitCode)" -Level WARN
@@ -839,8 +887,8 @@ function Repair-BiosBoot {
 
     # Step 3: Scan for OS
     Write-Log "Step 3/5: Scanning for OS entries with bootrec /scanos..." -Level STEP
-    $r = Invoke-LoggedCommand -Command 'bootrec' -Arguments @('/scanos') `
-        -Description "bootrec /scanos" -SaveRawAs "bootrec_scanos2.txt" -IgnoreExit
+    Invoke-LoggedCommand -Command 'bootrec' -Arguments @('/scanos') `
+        -Description "bootrec /scanos" -SaveRawAs "bootrec_scanos2.txt" -IgnoreExit | Out-Null
 
     # Step 4: Rebuild BCD
     Write-Log "Step 4/5: Rebuilding BCD with bootrec /rebuildbcd..." -Level STEP
@@ -897,7 +945,7 @@ function Run-Chkdsk {
         return $false
     }
 
-    $drive = $Script:SelectedWin.Drive  # e.g. "D:"
+    $drive = $Script:SelectedWin.Drive
     $driveLetter = $drive.TrimEnd('\')
 
     Write-Host "`n[INFO] CHKDSK will check the file system on $driveLetter" -ForegroundColor Cyan
@@ -906,17 +954,17 @@ function Run-Chkdsk {
     Write-Host ""
 
     $useR = Get-UserConfirmation "Include /R (bad sector scan)? Adds 30-90 minutes. [Y/N]"
-    $args = @($driveLetter)
+    $chkArgs = @($driveLetter)
     if ($useR) {
-        $args += '/R'
+        $chkArgs += '/R'
         Write-Log "CHKDSK will run with /F /R on $driveLetter" -Level INFO
     } else {
-        $args += '/F'
+        $chkArgs += '/F'
         Write-Log "CHKDSK will run with /F on $driveLetter" -Level INFO
     }
 
-    Write-Log "Running: chkdsk $($args -join ' ')" -Level STEP
-    $result = Invoke-LoggedCommand -Command 'chkdsk' -Arguments $args `
+    Write-Log "Running: chkdsk $($chkArgs -join ' ')" -Level STEP
+    $result = Invoke-LoggedCommand -Command 'chkdsk' -Arguments $chkArgs `
         -Description "CHKDSK on $driveLetter" -SaveRawAs "chkdsk_output.txt" -IgnoreExit
 
     Write-Log "CHKDSK exit code: $($result.ExitCode)" -Level INFO
@@ -925,7 +973,7 @@ function Run-Chkdsk {
     switch ($result.ExitCode) {
         0 { Write-Log "CHKDSK: No errors found." -Level SUCCESS }
         1 { Write-Log "CHKDSK: Errors found and fixed." -Level SUCCESS }
-        2 { Write-Log "CHKDSK: Disk cleanup (such as garbage collection) needs to be done." -Level WARN }
+        2 { Write-Log "CHKDSK: Disk cleanup needs to be performed." -Level WARN }
         3 { Write-Log "CHKDSK: Errors found but not all were fixed." -Level ERROR }
         default { Write-Log "CHKDSK: Exit code $($result.ExitCode) - review output." -Level WARN }
     }
@@ -950,8 +998,8 @@ function Run-OfflineSfc {
         return $false
     }
 
-    $winDir    = $Script:SelectedWin.WindowsDir
-    $bootDir   = $Script:SelectedWin.Drive
+    $winDir  = $Script:SelectedWin.WindowsDir
+    $bootDir = $Script:SelectedWin.Drive
 
     Write-Host "`n[INFO] Offline SFC will verify and repair Windows system files." -ForegroundColor Cyan
     Write-Host "       This can take 20-60 minutes depending on disk speed." -ForegroundColor Cyan
@@ -999,12 +1047,100 @@ function Run-OfflineSfc {
     } elseif ($output -match 'successfully repaired') {
         Write-Log "SFC: Corrupt files were found and repaired." -Level SUCCESS
     } elseif ($output -match 'unable to fix') {
-        Write-Log "SFC: Some files could not be repaired. Manual intervention needed." -Level ERROR
+        Write-Log "SFC: Some files could not be repaired. Recommend running DISM /RestoreHealth next." -Level ERROR
     } else {
         Write-Log "SFC: Scan completed. Review output above for details." -Level INFO
     }
 
     return $result.Success
+}
+
+# ============================================================
+# SECTION 10b: DISM OFFLINE REPAIR
+# ============================================================
+
+function Run-DismRepair {
+    <#
+    .SYNOPSIS Runs DISM offline image repair against the selected Windows installation.
+    .NOTES Requires either a WIM/ESD source on the USB or internet access via Windows Update.
+            Can repair system image corruption that SFC cannot fix.
+            Can take 30-60+ minutes.
+    #>
+    Write-Log "Running DISM offline repair (RestoreHealth)..." -Level SECTION
+
+    if (-not $Script:SelectedWin) {
+        Write-Log "No Windows installation selected." -Level ERROR
+        return $false
+    }
+
+    $imagePath = $Script:SelectedWin.Drive  # e.g. D:
+
+    Write-Host "`n[INFO] DISM will scan and repair the Windows component store." -ForegroundColor Cyan
+    Write-Host "       This can take 30-60 minutes." -ForegroundColor Cyan
+    if ($Script:WimSourcePath) {
+        Write-Host "       Source file: $Script:WimSourcePath" -ForegroundColor Green
+    } else {
+        Write-Host "       No local WIM/ESD source found. DISM will attempt Windows Update (requires internet)." -ForegroundColor Yellow
+        Write-Host "       In offline WinRE WITHOUT internet, this operation will likely fail." -ForegroundColor Yellow
+        Write-Host "       Copy sources\install.wim or install.esd from a Windows ISO to the USB stick root." -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    $confirm = Get-UserConfirmation "Proceed with DISM offline repair? [Y/N]"
+    if (-not $confirm) {
+        Write-Log "DISM repair skipped by user." -Level INFO
+        return $false
+    }
+
+    $dismCmd = Get-Command 'dism' -ErrorAction SilentlyContinue
+    if (-not $dismCmd) {
+        Write-Log "dism.exe not found. Cannot run DISM repair." -Level ERROR
+        return $false
+    }
+
+    # First: scan image health (fast, non-destructive)
+    Write-Log "Step 1/3: Scanning image health..." -Level STEP
+    $scanResult = Invoke-LoggedCommand -Command 'dism' `
+        -Arguments @("/Image:$imagePath", '/Cleanup-Image', '/ScanHealth') `
+        -Description "DISM ScanHealth" -SaveRawAs "dism_scanhealth.txt" -IgnoreExit
+
+    $scanOut = ($scanResult.Output -join ' ').ToLower()
+    if ($scanOut -match 'no component store corruption detected') {
+        Write-Log "DISM ScanHealth: No corruption detected." -Level SUCCESS
+    } else {
+        Write-Log "DISM ScanHealth: Corruption or issues detected. Proceeding to RestoreHealth." -Level WARN
+    }
+
+    # Second: check image health
+    Write-Log "Step 2/3: Checking image health..." -Level STEP
+    Invoke-LoggedCommand -Command 'dism' `
+        -Arguments @("/Image:$imagePath", '/Cleanup-Image', '/CheckHealth') `
+        -Description "DISM CheckHealth" -SaveRawAs "dism_checkhealth.txt" -IgnoreExit | Out-Null
+
+    # Third: restore image health
+    Write-Log "Step 3/3: Running RestoreHealth..." -Level STEP
+    $restoreArgs = @("/Image:$imagePath", '/Cleanup-Image', '/RestoreHealth')
+    if ($Script:WimSourcePath) {
+        $restoreArgs += "/Source:WIM:$($Script:WimSourcePath):1"
+        $restoreArgs += '/LimitAccess'
+        Write-Log "  Using local WIM source: $Script:WimSourcePath" -Level INFO
+    }
+
+    $restoreResult = Invoke-LoggedCommand -Command 'dism' `
+        -Arguments $restoreArgs `
+        -Description "DISM RestoreHealth" -SaveRawAs "dism_restorehealth.txt" -IgnoreExit
+
+    $restoreOut = ($restoreResult.Output -join ' ').ToLower()
+    if ($restoreResult.Success -or $restoreOut -match 'the restore operation completed successfully') {
+        Write-Log "DISM RestoreHealth completed successfully." -Level SUCCESS
+        return $true
+    } elseif ($restoreOut -match 'source files could not be found') {
+        Write-Log "DISM: Source files not found. Place install.wim/install.esd in the USB root and retry." -Level ERROR
+    } else {
+        Write-Log "DISM RestoreHealth failed (exit $($restoreResult.ExitCode)). Review dism_restorehealth.txt" -Level ERROR
+    }
+
+    return $false
 }
 
 # ============================================================
@@ -1014,274 +1150,4 @@ function Run-OfflineSfc {
 function Get-UserConfirmation {
     <#
     .SYNOPSIS Prompts user for Y/N confirmation.
-    .RETURNS $true if user confirmed, $false otherwise.
-    #>
-    param([string]$Prompt)
-    do {
-        $response = Read-Host "`n$Prompt"
-    } while ($response -notmatch '^[YyNn]$')
-    $confirmed = $response -match '^[Yy]$'
-    Write-Log "User responded: $response (to: $Prompt)"
-    return $confirmed
-}
-
-function Export-Report {
-    <#
-    .SYNOPSIS Exports a comprehensive summary report of all actions taken.
-    #>
-    Write-Log "Generating final report..." -Level SECTION
-
-    $reportPath = Join-Path $Script:LogDir "boot-repair-report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-    $sb = [System.Text.StringBuilder]::new()
-
-    $null = $sb.AppendLine("="*60)
-    $null = $sb.AppendLine("WINDOWS BOOT REPAIR - FULL REPORT")
-    $null = $sb.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    $null = $sb.AppendLine("="*60)
-    $null = $sb.AppendLine("")
-    $null = $sb.AppendLine("SYSTEM INFORMATION")
-    $null = $sb.AppendLine("-"*40)
-    $null = $sb.AppendLine("Firmware Mode   : $Script:BootMode")
-    $null = $sb.AppendLine("Partition Style : $Script:PartStyle")
-    $null = $sb.AppendLine("EFI Drive       : $(if ($Script:EfiDrive) {"$Script:EfiDrive`:"}  else {'Not found'})")
-    $null = $sb.AppendLine("")
-    $null = $sb.AppendLine("WINDOWS INSTALLATIONS FOUND: $($Script:WinInstalls.Count)")
-    foreach ($inst in $Script:WinInstalls) {
-        $null = $sb.AppendLine("  - $($inst.Drive)\ | $($inst.Version) | Build $($inst.Build) | $($inst.BootType)")
-    }
-    $null = $sb.AppendLine("")
-    if ($Script:SelectedWin) {
-        $null = $sb.AppendLine("SELECTED INSTALLATION")
-        $null = $sb.AppendLine("-"*40)
-        $null = $sb.AppendLine("Drive     : $($Script:SelectedWin.Drive)")
-        $null = $sb.AppendLine("Windows   : $($Script:SelectedWin.WindowsDir)")
-        $null = $sb.AppendLine("Version   : $($Script:SelectedWin.Version)")
-        $null = $sb.AppendLine("Build     : $($Script:SelectedWin.Build)")
-        $null = $sb.AppendLine("Boot Type : $($Script:SelectedWin.BootType)")
-        $null = $sb.AppendLine("")
-    }
-    $null = $sb.AppendLine("REPAIR ACTIONS")
-    $null = $sb.AppendLine("-"*40)
-    $null = $sb.AppendLine("Diagnostics Collected : $Script:DiagComplete")
-    $null = $sb.AppendLine("Repair Attempted      : $Script:RepairDone")
-    $null = $sb.AppendLine("")
-    $null = $sb.AppendLine("LOG FILES")
-    $null = $sb.AppendLine("-"*40)
-    $null = $sb.AppendLine("Main log     : $Script:LogFile")
-    $null = $sb.AppendLine("Raw logs dir : $Script:RawLogDir")
-    $null = $sb.AppendLine("Transcript   : $Script:TranscriptPath")
-    $null = $sb.AppendLine("")
-    $null = $sb.AppendLine("VERDICT")
-    $null = $sb.AppendLine("-"*40)
-    $verdict = Get-FinalVerdict
-    $null = $sb.AppendLine($verdict)
-    $null = $sb.AppendLine("")
-    $null = $sb.AppendLine("="*60)
-    $null = $sb.AppendLine("END OF REPORT")
-    $null = $sb.AppendLine("="*60)
-
-    $reportContent = $sb.ToString()
-
-    try {
-        Set-Content -Path $reportPath -Value $reportContent -Encoding UTF8
-        Write-Log "Report saved: $reportPath" -Level SUCCESS
-        Write-Host "`n$reportContent" -ForegroundColor White
-    } catch {
-        Write-Log "Could not save report: $_" -Level ERROR
-        Write-Host "`n$reportContent" -ForegroundColor White
-    }
-
-    return $reportPath
-}
-
-function Get-FinalVerdict {
-    <#
-    .SYNOPSIS Returns a verdict string based on the current system state.
-    #>
-    if ($Script:WinInstalls.Count -eq 0) {
-        return "[VERDICT] NO VALID WINDOWS INSTALLATION DETECTED - possible hardware/storage issue or severely corrupt disk."
-    }
-
-    if (-not $Script:RepairDone) {
-        return "[VERDICT] DIAGNOSTICS ONLY - No repair was performed in this session."
-    }
-
-    if ($Script:BootMode -eq 'UEFI' -and -not $Script:EfiDrive) {
-        return "[VERDICT] EFI PARTITION MISSING OR INACCESSIBLE - UEFI boot cannot be fully repaired without an accessible EFI System Partition."
-    }
-
-    if ($Script:RepairDone) {
-        return "[VERDICT] BOOT FILES REBUILT SUCCESSFULLY - Restart the computer to verify. If boot still fails, run CHKDSK or check hardware."
-    }
-
-    return "[VERDICT] REPAIR ATTEMPTED BUT UNCERTAIN - Review log files for details. Consider running CHKDSK and offline SFC."
-}
-
-# ============================================================
-# SECTION 12: INTERACTIVE MENU
-# ============================================================
-
-function Show-MainMenu {
-    <#
-    .SYNOPSIS Displays the main interactive repair menu and handles user selection.
-    #>
-    $continue = $true
-
-    while ($continue) {
-        Write-Host "`n$('='*60)" -ForegroundColor White
-        Write-Host "  WINDOWS BOOT REPAIR UTILITY v2.0" -ForegroundColor Cyan
-        Write-Host "$('='*60)" -ForegroundColor White
-        Write-Host "  Firmware : $Script:BootMode    |  Partition: $Script:PartStyle" -ForegroundColor DarkGray
-        Write-Host "  Windows  : $($Script:WinInstalls.Count) found   |  Selected : $(if ($Script:SelectedWin) {$Script:SelectedWin.Drive} else {'None'})" -ForegroundColor DarkGray
-        Write-Host "$('-'*60)" -ForegroundColor DarkGray
-        Write-Host "  [1] Collect diagnostics only" -ForegroundColor Yellow
-        Write-Host "  [2] Quick repair (auto-detect and repair)" -ForegroundColor Green
-        Write-Host "  [3] Full repair (diagnostics + quick repair + CHKDSK)" -ForegroundColor Green
-        Write-Host "  [4] Rebuild EFI boot files (UEFI/GPT systems)" -ForegroundColor Cyan
-        Write-Host "  [5] BIOS/MBR boot repair (Legacy BIOS systems)" -ForegroundColor Cyan
-        Write-Host "  [6] Run CHKDSK on Windows volume" -ForegroundColor Magenta
-        Write-Host "  [7] Run offline SFC (System File Checker)" -ForegroundColor Magenta
-        Write-Host "  [8] Export full diagnostic report" -ForegroundColor White
-        Write-Host "  [9] Re-select Windows installation" -ForegroundColor White
-        Write-Host "  [0] Exit" -ForegroundColor Red
-        Write-Host "$('='*60)" -ForegroundColor White
-
-        $choice = Read-Host "`nSelect option"
-        Write-Log "User selected menu option: $choice"
-
-        switch ($choice) {
-            '1' {
-                Collect-Diagnostics
-                Show-DiagnosticSummary
-            }
-            '2' {
-                if (-not $Script:DiagComplete) { Collect-Diagnostics }
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                if ($Script:SelectedWin) {
-                    if ($Script:BootMode -eq 'UEFI') {
-                        Repair-UefiBoot | Out-Null
-                    } else {
-                        Repair-BiosBoot | Out-Null
-                    }
-                    Show-DiagnosticSummary
-                } else {
-                    Write-Log "Cannot repair - no Windows installation selected." -Level ERROR
-                }
-            }
-            '3' {
-                if (-not $Script:DiagComplete) { Collect-Diagnostics }
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                if ($Script:SelectedWin) {
-                    if ($Script:BootMode -eq 'UEFI') { Repair-UefiBoot | Out-Null }
-                    else { Repair-BiosBoot | Out-Null }
-                    Run-Chkdsk | Out-Null
-                    Show-DiagnosticSummary
-                    Export-Report | Out-Null
-                } else {
-                    Write-Log "Cannot repair - no Windows installation selected." -Level ERROR
-                }
-            }
-            '4' {
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                Repair-UefiBoot | Out-Null
-            }
-            '5' {
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                Repair-BiosBoot | Out-Null
-            }
-            '6' {
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                Run-Chkdsk | Out-Null
-            }
-            '7' {
-                if (-not $Script:SelectedWin) { Select-WindowsInstallation | Out-Null }
-                Run-OfflineSfc | Out-Null
-            }
-            '8' {
-                Export-Report | Out-Null
-            }
-            '9' {
-                $Script:SelectedWin = $null
-                Get-WindowsInstallations | Out-Null
-                Select-WindowsInstallation | Out-Null
-            }
-            '0' {
-                $continue = $false
-                Write-Log "User exited menu." -Level INFO
-            }
-            default {
-                Write-Host "  Invalid option. Please enter 0-9." -ForegroundColor Red
-            }
-        }
-    }
-}
-
-# ============================================================
-# SECTION 13: MAIN ENTRY POINT
-# ============================================================
-
-function Main {
-    <#
-    .SYNOPSIS Main entry point - initializes and starts the repair tool.
-    #>
-    try { Clear-Host } catch {}
-
-    Write-Host @"
-$('='*60)
-  WINDOWS BOOT REPAIR UTILITY v2.0
-  Professional Boot Recovery Tool for WinRE/WinPE
-$('='*60)
-  !! Run as Administrator !!
-  !! From WinRE or WinPE boot USB !!
-$('='*60)
-"@ -ForegroundColor Cyan
-
-    Initialize-Logging
-
-    $env = Get-Environment
-
-    Get-BootMode | Out-Null
-
-    Get-DiskInventory | Out-Null
-
-    Get-WindowsInstallations | Out-Null
-
-    Show-DiagnosticSummary
-
-    if ($Script:WinInstalls.Count -gt 0) {
-        Select-WindowsInstallation | Out-Null
-    } else {
-        Write-Host "`n[CRITICAL] No Windows installation found on any accessible drive." -ForegroundColor Red
-        Write-Host "  - Check disk connections" -ForegroundColor Yellow
-        Write-Host "  - Drive letters may not be assigned - run Option 1 for diagnostics" -ForegroundColor Yellow
-        Write-Host "  - The disk may have severe corruption or hardware failure" -ForegroundColor Yellow
-        Write-Host ""
-    }
-
-    Show-MainMenu
-
-    Remove-TempEfiLetter
-
-    $verdict = Get-FinalVerdict
-    Write-Host "`n$('='*60)" -ForegroundColor White
-    Write-Host $verdict -ForegroundColor $(
-        if ($verdict -match 'SUCCESSFULLY') { 'Green' }
-        elseif ($verdict -match 'MISSING|NO VALID|HARDWARE') { 'Red' }
-        else { 'Yellow' }
-    )
-    Write-Host "$('='*60)`n" -ForegroundColor White
-
-    Write-Log "Session ended: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Level INFO
-    Write-Log "Log files saved to: $Script:LogDir" -Level SUCCESS
-
-    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
-
-    Write-Host "Log files saved to: $Script:LogDir" -ForegroundColor Green
-    Write-Host "Press any key to exit..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-}
-
-# ============================================================
-# EXECUTE
-# ============================================================
-Main
+    .RETURNS $true if user confirmed, $fals
