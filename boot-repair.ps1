@@ -19,6 +19,7 @@
     - Drive letters are assigned dynamically in WinPE; C: IS NOT assumed
     - Some bootrec operations (/fixboot) may fail with "Access is denied" on UEFI systems -- handled explicitly
     - Transcript may fail if the log path is on a read-only volume
+    - $env:TEMP is NULL in WinRE/WinPE -- always use Get-SafeTempPath
 
     AUTHOR  : Boot Repair Utility v2.0
     COMPAT  : Windows 10/11, WinRE, WinPE x64
@@ -46,8 +47,58 @@ $Script:EfiTempLetter   = $null   # If we assigned a temp letter, store it here 
 $Script:SystemDisk      = $null   # Disk number hosting Windows
 $Script:DiagComplete    = $false
 $Script:RepairDone      = $false
-# FIX Bug3: track whether we are in WinPE/WinRE so the script-drive skip applies only there
+# Track whether we are in WinPE/WinRE so the script-drive skip applies only there
 $Script:IsWinPE         = $false
+
+# ============================================================
+# SECTION 0.5: SAFE TEMP PATH
+# ============================================================
+
+function Get-SafeTempPath {
+    <#
+    .SYNOPSIS Returns a writable temporary directory path safe for use in WinRE/WinPE.
+    .NOTES    FIX: $env:TEMP is NULL in WinRE/WinPE -- bare Join-Path $env:TEMP ... crashes.
+              This function probes multiple candidates in order and returns the first
+              writable path, creating it if necessary.
+    #>
+    param([string]$ChildPath = '')
+
+    # Candidate paths in priority order.
+    # X:\Temp is the WinPE ramdisk scratch space (always writable when X: exists).
+    # C:\Windows\Temp and \Windows\Temp are fallbacks for WinRE with a mounted C:.
+    # $env:TEMP / $env:TMP are last because they are null in WinPE.
+    $candidates = @(
+        'X:\Temp',
+        'C:\Windows\Temp',
+        '\Windows\Temp',
+        $env:TEMP,
+        $env:TMP,
+        (Join-Path $Script:ScriptDrive 'Temp')
+    )
+
+    foreach ($base in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($base)) { continue }
+        try {
+            if (-not (Test-Path $base -ErrorAction SilentlyContinue)) {
+                New-Item -ItemType Directory -Path $base -Force -ErrorAction Stop | Out-Null
+            }
+            # Verify write access by touching a probe file
+            $probe = Join-Path $base '.writetest'
+            [System.IO.File]::WriteAllText($probe, 'ok')
+            Remove-Item $probe -Force -ErrorAction SilentlyContinue
+            # Found a writable base
+            if ($ChildPath) {
+                $full = Join-Path $base $ChildPath
+                return $full
+            }
+            return $base
+        } catch { continue }
+    }
+
+    # Absolute last resort -- current directory
+    if ($ChildPath) { return (Join-Path '.' $ChildPath) }
+    return '.'
+}
 
 # ============================================================
 # SECTION 1: LOGGING INFRASTRUCTURE
@@ -82,8 +133,8 @@ function Initialize-Logging {
         Write-Log "Raw logs       : $Script:RawLogDir"
     }
     catch {
-        # Fallback log to TEMP if USB is not writable
-        $fallback = Join-Path $env:TEMP "BootRepair"
+        # FIX: use Get-SafeTempPath instead of bare $env:TEMP (null in WinRE)
+        $fallback = Get-SafeTempPath 'BootRepair'
         New-Item -ItemType Directory -Path $fallback -Force -ErrorAction SilentlyContinue | Out-Null
         $Script:LogDir    = $fallback
         $Script:LogFile   = Join-Path $fallback "boot-repair.log"
@@ -138,7 +189,7 @@ function Invoke-LoggedCommand {
     .PARAMETER   IgnoreExit   If set, non-zero exit codes do not throw.
     .RETURNS     Object with .Output (string[]), .ExitCode (int), .Success (bool)
 
-    FIX Bug1+Bug4: blank/whitespace-only lines from command output (diskpart, bcdedit,
+    FIX: blank/whitespace-only lines from command output (diskpart, bcdedit,
     mountvol etc. emit decorative blank lines) are filtered BEFORE Write-Log and before
     console print.  This prevents the 'Cannot bind argument to parameter Message because
     it is an empty string' StrictMode exception.
@@ -168,7 +219,7 @@ function Invoke-LoggedCommand {
         $rawOutput       = & $Command $Arguments 2>&1
         $result.ExitCode = $LASTEXITCODE
 
-        # FIX Bug1+Bug4: convert to strings then drop blank/whitespace-only lines
+        # Convert to strings then drop blank/whitespace-only lines
         $allLines        = @($rawOutput | ForEach-Object { "$_" })
         $result.Output   = @($allLines  | Where-Object { $_.Trim() -ne '' })
         $result.Success  = $result.ExitCode -eq 0
@@ -182,7 +233,6 @@ function Invoke-LoggedCommand {
         if ($result.Output.Count -gt 50) {
             Write-Host "  [Output: $($result.Output.Count) lines -- see log]" -ForegroundColor DarkGray
         } else {
-            # FIX Bug4: only print non-blank lines to console as well
             $result.Output | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
         }
 
@@ -243,7 +293,7 @@ function Get-Environment {
     }
     if ($env:WINPE -eq '1') { $isWinPE = $true }
 
-    # FIX Bug3: store WinPE state globally so Get-WindowsInstallations can use it
+    # Store WinPE state globally so Get-WindowsInstallations can use it
     $Script:IsWinPE = $isWinPE
 
     if      ($isWinRE) { Write-Log "Environment: Windows Recovery Environment (WinRE)" -Level SUCCESS }
@@ -378,8 +428,9 @@ function Get-DiskInventory {
     }
 
     # Always run diskpart for raw log -- reliable in all PE variants
+    # FIX: use Get-SafeTempPath instead of bare $env:TEMP
     $dpScript = "list disk`r`nlist volume`r`nlist partition`r`n"
-    $dpFile   = Join-Path $env:TEMP "dplist.txt"
+    $dpFile   = Get-SafeTempPath 'dplist.txt'
     $dpScript | Set-Content $dpFile -Encoding ASCII -ErrorAction SilentlyContinue
     $dpResult = Invoke-LoggedCommand -Command 'diskpart' -Arguments @('/s', $dpFile) `
         -Description "diskpart list disk/vol/partition" -SaveRawAs "diskpartlist.txt" -IgnoreExit
@@ -425,8 +476,9 @@ function Get-EfiPartition {
                         $freeLetter = Get-AvailableDriveLetter
                         if ($freeLetter) {
                             try {
+                                # FIX: use Get-SafeTempPath instead of bare $env:TEMP
                                 $dpAssign = "select disk $($disk.DiskNumber)`r`nselect partition $($p.PartitionNumber)`r`nassign letter=$freeLetter`r`n"
-                                $dpFile   = Join-Path $env:TEMP "dpassign.txt"
+                                $dpFile   = Get-SafeTempPath 'dpassign.txt'
                                 $dpAssign | Set-Content $dpFile -Encoding ASCII
                                 $r = Invoke-LoggedCommand -Command 'diskpart' -Arguments @('/s', $dpFile) `
                                     -Description "Assign letter $freeLetter to EFI partition" -IgnoreExit
@@ -450,8 +502,9 @@ function Get-EfiPartition {
     catch {
         Write-Log "Error enumerating EFI partition via PowerShell: $_ -- trying diskpart..." -Level WARN
         # Fallback: parse diskpart output
+        # FIX: use Get-SafeTempPath instead of bare $env:TEMP
         $dpScript = "list disk`r`n"
-        $dpFile   = Join-Path $env:TEMP "dpefi.txt"
+        $dpFile   = Get-SafeTempPath 'dpefi.txt'
         $dpScript | Set-Content $dpFile -Encoding ASCII
         Invoke-LoggedCommand -Command 'diskpart' -Arguments @('/s', $dpFile) -IgnoreExit | Out-Null
         Remove-Item $dpFile -Force -ErrorAction SilentlyContinue
@@ -473,8 +526,9 @@ function Remove-TempEfiLetter {
     #>
     if ($Script:EfiTempLetter) {
         Write-Log "Removing temporary EFI drive letter: $Script:EfiTempLetter..." -Level STEP
+        # FIX: use Get-SafeTempPath instead of bare $env:TEMP
         $dpScript = "select volume $Script:EfiTempLetter`r`nremove letter=$Script:EfiTempLetter`r`n"
-        $dpFile   = Join-Path $env:TEMP "dpremove.txt"
+        $dpFile   = Get-SafeTempPath 'dpremove.txt'
         $dpScript | Set-Content $dpFile -Encoding ASCII
         Invoke-LoggedCommand -Command 'diskpart' -Arguments @('/s', $dpFile) `
             -Description "Remove temp EFI letter $Script:EfiTempLetter" -IgnoreExit | Out-Null
@@ -503,10 +557,10 @@ function Get-WindowsInstallations {
     .SYNOPSIS Scans all accessible drive letters for valid Windows installations.
     .NOTES    Does NOT assume C:. Checks for all key Windows files.
 
-    FIX Bug3: The script-drive exclusion only applies when running in WinPE/WinRE.
-    In a standard Windows session the script may live on C: which is also where
-    Windows lives -- skipping it would mean never finding any installation.
-    In WinPE the script runs from the USB (e.g. E:) so excluding it is correct.
+              The script-drive exclusion only applies when running in WinPE/WinRE.
+              In a standard Windows session the script may live on C: which is also where
+              Windows lives -- skipping it would mean never finding any installation.
+              In WinPE the script runs from the USB (e.g. E:) so excluding it is correct.
     #>
     Write-Log "Scanning for Windows installations on all accessible drives..." -Level SECTION
 
@@ -520,9 +574,7 @@ function Get-WindowsInstallations {
     Write-Log "Checking drives: $($drives -join ', ')"
 
     foreach ($drive in $drives) {
-        # FIX Bug3: skip script drive only when running inside WinPE/WinRE
-        # In a normal Windows session the USB and Windows share the same drive space
-        # so we must not exclude based on script location.
+        # Skip script drive only when running inside WinPE/WinRE
         if ($Script:IsWinPE -and ($drive -eq $Script:ScriptDrive.TrimEnd('\'))) {
             Write-Log "  Skipping script drive (WinPE mode): $drive"
             continue
@@ -548,17 +600,26 @@ function Get-WindowsInstallations {
             try {
                 $hivePath = Join-Path $drive "Windows\System32\Config\SOFTWARE"
                 if (Test-Path $hivePath) {
-                    # Determine Windows version from registry hive -- offline mount attempt
-                    $hiveKey = 'HKLM\BOOTCHECK'
-                    & reg.exe load $hiveKey $hivePath 2>&1 | Out-Null
-                    if ($LASTEXITCODE -eq 0) {
-                        $psKey   = "Registry::$hiveKey\Microsoft\Windows NT\CurrentVersion"
-                        $ntProps = Get-ItemProperty $psKey -ErrorAction SilentlyContinue
-                        if ($ntProps) {
-                            $winVer   = $ntProps.ProductName
-                            $buildNum = "$($ntProps.CurrentBuildNumber).$($ntProps.UBR)"
+                    # FIX: try/finally guarantees reg.exe unload even on exception,
+                    # preventing orphaned hive mounts that block subsequent scans.
+                    $hiveKey    = 'HKLM\BOOTCHECK'
+                    $hiveLoaded = $false
+                    try {
+                        & reg.exe load $hiveKey $hivePath 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            $hiveLoaded = $true
+                            $psKey   = "Registry::$hiveKey\Microsoft\Windows NT\CurrentVersion"
+                            $ntProps = Get-ItemProperty $psKey -ErrorAction SilentlyContinue
+                            if ($ntProps) {
+                                $winVer   = $ntProps.ProductName
+                                $buildNum = "$($ntProps.CurrentBuildNumber).$($ntProps.UBR)"
+                            }
                         }
-                        & reg.exe unload $hiveKey 2>&1 | Out-Null
+                    } finally {
+                        # Always unload -- even if an exception occurred mid-read
+                        if ($hiveLoaded) {
+                            & reg.exe unload $hiveKey 2>&1 | Out-Null
+                        }
                     }
                 }
             } catch { <# version detection not critical #> }
@@ -724,10 +785,10 @@ function Backup-BcdStore {
     .SYNOPSIS Creates a timestamped backup of the BCD store before any modification.
     .NOTES    Silently skips if log dir not initialized or BCD not found.
 
-    FIX Bug2: Invoke-LoggedCommand is wrapped in try/catch so $exportResult is
-    never $null when StrictMode is active.  Previously if the command threw before
-    returning, $exportResult was unset and accessing .Success caused a StrictMode
-    'property cannot be found' exception.
+              Invoke-LoggedCommand is wrapped in try/catch so $exportResult is
+              never $null when StrictMode is active.  Previously if the command threw
+              before returning, $exportResult was unset and accessing .Success caused a
+              StrictMode 'property cannot be found' exception.
     #>
     Write-Log "Backing up BCD store..." -Level STEP
 
@@ -739,7 +800,7 @@ function Backup-BcdStore {
     $ts      = Get-Date -Format 'yyyyMMdd_HHmmss'
     $bcdDest = Join-Path $Script:LogDir "BCD_backup_$ts"
 
-    # FIX Bug2: explicit try/catch so $exportResult always has a value after the block
+    # Explicit try/catch so $exportResult always has a value after the block
     $exportResult = $null
     try {
         $exportResult = Invoke-LoggedCommand -Command 'bcdedit' `
@@ -850,11 +911,14 @@ function Repair-UefiBoot {
     $scanResult = Invoke-LoggedCommand -Command 'bootrec' -Arguments @('/scanos') `
         -Description "bootrec /scanos" -SaveRawAs "bootrec_scanos2.txt" -IgnoreExit
 
-    # Step 5b: bootrec /rebuildbcd (use with caution -- interactive)
-    Write-Log "Step 5/5: Rebuilding BCD with bootrec /rebuildbcd..." -Level STEP
-    Write-Log "  NOTE: This is an interactive command -- it will prompt you to add entries." -Level WARN
-    Invoke-LoggedCommand -Command 'bootrec' -Arguments @('/rebuildbcd') `
-        -Description "bootrec /rebuildbcd" -SaveRawAs "bootrec_rebuildbcd.txt" -IgnoreExit | Out-Null
+    # Step 5b: bootrec /rebuildbcd
+    # FIX: pipe 'echo Y' via cmd.exe so the interactive "Add installation to boot list? Yes/No/All"
+    # prompt is answered automatically -- without this the command blocks forever in unattended WinPE.
+    Write-Log "Step 5/5: Rebuilding BCD with bootrec /rebuildbcd (unattended Y)..." -Level STEP
+    $rebuildCmd = 'cmd.exe'
+    $rebuildArgs = @('/c', 'echo Y | bootrec /rebuildbcd')
+    Invoke-LoggedCommand -Command $rebuildCmd -Arguments $rebuildArgs `
+        -Description "bootrec /rebuildbcd (unattended)" -SaveRawAs "bootrec_rebuildbcd.txt" -IgnoreExit | Out-Null
 
     # Step 6: Check if EFI now exists and BCD was created
     if (Test-Path $efiBootPath -ErrorAction SilentlyContinue) {
@@ -927,10 +991,11 @@ function Repair-BiosBoot {
         -Description "bootrec /scanos" -SaveRawAs "bootrec_scanos.txt" -IgnoreExit | Out-Null
 
     # Step 5: Rebuild BCD
-    Write-Log "Step 5/5: Rebuilding BCD with bootrec /rebuildbcd..." -Level STEP
-    Write-Log "  NOTE: This is an interactive command -- it will prompt you to add entries." -Level WARN
-    $rebuildResult = Invoke-LoggedCommand -Command 'bootrec' -Arguments @('/rebuildbcd') `
-        -Description "bootrec /rebuildbcd" -SaveRawAs "bootrec_rebuildbcd.txt" -IgnoreExit
+    # FIX: pipe 'echo Y' via cmd.exe so the interactive prompt is answered automatically
+    Write-Log "Step 5/5: Rebuilding BCD with bootrec /rebuildbcd (unattended Y)..." -Level STEP
+    $rebuildResult = Invoke-LoggedCommand -Command 'cmd.exe' `
+        -Arguments @('/c', 'echo Y | bootrec /rebuildbcd') `
+        -Description "bootrec /rebuildbcd (unattended)" -SaveRawAs "bootrec_rebuildbcd.txt" -IgnoreExit
 
     if (-not $rebuildResult.Success) {
         Write-Log "bootrec /rebuildbcd failed. Attempting bcdboot as fallback..." -Level WARN
@@ -1112,6 +1177,29 @@ function Get-UserConfirmation {
     return $confirmed
 }
 
+function Wait-KeyPress {
+    <#
+    .SYNOPSIS Waits for a key press, with graceful fallback for non-interactive hosts.
+    .NOTES    FIX: The original code used `if ($Host.UI.RawUI.ReadKey)` which evaluates
+              the METHOD OBJECT (always truthy) rather than checking host capability.
+              This caused ReadKey to always be called, crashing in non-interactive hosts.
+              Correct check: test whether KeyAvailable property exists (RawUI is $null in
+              non-interactive hosts like SCCM task sequences or redirected stdin).
+    #>
+    param([string]$Message = 'Press any key to continue...')
+    Write-Host $Message -ForegroundColor DarkGray
+    if ($Host.UI.RawUI -ne $null) {
+        try {
+            $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        } catch {
+            # Non-interactive host (e.g. redirected stdin, SCCM TS) -- fall back silently
+            try { Read-Host } catch {}
+        }
+    } else {
+        try { Read-Host } catch {}
+    }
+}
+
 function Export-Report {
     <#
     .SYNOPSIS Exports a comprehensive summary report of all actions taken.
@@ -1159,6 +1247,7 @@ function Export-Report {
     $null = $sb.AppendLine("Transcript   : $Script:TranscriptPath")
     $null = $sb.AppendLine("")
 
+    # VERDICT
     $null = $sb.AppendLine("VERDICT")
     $null = $sb.AppendLine("-"*40)
     $verdict = Get-FinalVerdict
@@ -1212,6 +1301,10 @@ function Get-FinalVerdict {
 function Show-MainMenu {
     <#
     .SYNOPSIS Displays the main interactive repair menu and handles user selection.
+    .NOTES    FIX: Removed the tail-recursive Show-MainMenu call that existed at the
+              bottom of the 'default' branch. The outer while($continue) loop already
+              handles looping; a recursive call would accumulate stack frames over long
+              sessions and eventually cause a StackOverflowException.
     #>
     $continue = $true
 
@@ -1298,6 +1391,7 @@ function Show-MainMenu {
                 Write-Log "User exited menu." -Level INFO
             }
             default {
+                # FIX: no recursive Show-MainMenu call here -- while loop handles re-display
                 Write-Host "  Invalid option. Please enter 0-9." -ForegroundColor Red
             }
         }
@@ -1326,7 +1420,7 @@ $('='*60)
 
     Initialize-Logging
 
-    # FIX Bug3: Get-Environment must run BEFORE Get-WindowsInstallations
+    # Get-Environment must run BEFORE Get-WindowsInstallations
     # so $Script:IsWinPE is set correctly before the drive-skip logic executes
     $env = Get-Environment
 
@@ -1365,8 +1459,15 @@ $('='*60)
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
 
     Write-Host "Log files saved to: $Script:LogDir" -ForegroundColor Green
-    Write-Host "Press any key to exit..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+
+    # FIX: wrapped in try/catch -- ReadKey throws in non-interactive hosts (e.g. redirected
+    # stdin, SCCM task sequences). Falls back to Read-Host which is always safe.
+    try {
+        Write-Host "Press any key to exit..." -ForegroundColor DarkGray
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch {
+        try { Read-Host "Press Enter to exit" } catch {}
+    }
 }
 
 # ============================================================
