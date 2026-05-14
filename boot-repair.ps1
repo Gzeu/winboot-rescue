@@ -1,1 +1,0 @@
-$(cat /tmp/boot-repair-full.ps1)
