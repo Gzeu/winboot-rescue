@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Windows Boot Recovery Utility - Professional Boot Repair Tool
@@ -46,6 +46,8 @@ $Script:EfiTempLetter   = $null   # If we assigned a temp letter, store it here 
 $Script:SystemDisk      = $null   # Disk number hosting Windows
 $Script:DiagComplete    = $false
 $Script:RepairDone      = $false
+# FIX Bug3: track whether we are in WinPE/WinRE so the script-drive skip applies only there
+$Script:IsWinPE         = $false
 
 # ============================================================
 # SECTION 1: LOGGING INFRASTRUCTURE
@@ -135,6 +137,11 @@ function Invoke-LoggedCommand {
     .PARAMETER   SaveRawAs    If provided, raw output is saved to a file in RawLogDir.
     .PARAMETER   IgnoreExit   If set, non-zero exit codes do not throw.
     .RETURNS     Object with .Output (string[]), .ExitCode (int), .Success (bool)
+
+    FIX Bug1+Bug4: blank/whitespace-only lines from command output (diskpart, bcdedit,
+    mountvol etc. emit decorative blank lines) are filtered BEFORE Write-Log and before
+    console print.  This prevents the 'Cannot bind argument to parameter Message because
+    it is an empty string' StrictMode exception.
     #>
     param(
         [Parameter(Mandatory)][string]$Command,
@@ -157,18 +164,25 @@ function Invoke-LoggedCommand {
     $result = [PSCustomObject]@{ Output = @(); ExitCode = 0; Success = $false; Skipped = $false }
 
     try {
-        # Use & to invoke and capture stdout+stderr
-        $output          = & $Command $Arguments 2>&1
+        # Capture stdout+stderr; convert everything to string first
+        $rawOutput       = & $Command $Arguments 2>&1
         $result.ExitCode = $LASTEXITCODE
-        $result.Output   = $output | ForEach-Object { "$_" }
+
+        # FIX Bug1+Bug4: convert to strings then drop blank/whitespace-only lines
+        $allLines        = @($rawOutput | ForEach-Object { "$_" })
+        $result.Output   = @($allLines  | Where-Object { $_.Trim() -ne '' })
         $result.Success  = $result.ExitCode -eq 0
 
-        foreach ($line in $result.Output) { Write-Log $line -Level RAW -NoConsole:($result.Output.Count -gt 50) }
+        # Log non-blank lines only
+        foreach ($line in $result.Output) {
+            Write-Log $line -Level RAW -NoConsole:($result.Output.Count -gt 50)
+        }
 
         # Print abbreviated output to console if large
         if ($result.Output.Count -gt 50) {
             Write-Host "  [Output: $($result.Output.Count) lines -- see log]" -ForegroundColor DarkGray
         } else {
+            # FIX Bug4: only print non-blank lines to console as well
             $result.Output | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
         }
 
@@ -220,7 +234,7 @@ function Get-Environment {
 
     # X: drive is the WinPE ramdisk in most scenarios
     if (Test-Path "X:\Windows\System32" -ErrorAction SilentlyContinue) { $isWinPE = $true }
-    if (Test-Path "X:\Sources" -ErrorAction SilentlyContinue)          { $isWinPE = $true }
+    if (Test-Path "X:\Sources"          -ErrorAction SilentlyContinue) { $isWinPE = $true }
 
     # WinRE marker
     if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\MiniNT" -ErrorAction SilentlyContinue) {
@@ -228,6 +242,9 @@ function Get-Environment {
         $isWinRE = $true
     }
     if ($env:WINPE -eq '1') { $isWinPE = $true }
+
+    # FIX Bug3: store WinPE state globally so Get-WindowsInstallations can use it
+    $Script:IsWinPE = $isWinPE
 
     if      ($isWinRE) { Write-Log "Environment: Windows Recovery Environment (WinRE)" -Level SUCCESS }
     elseif  ($isWinPE) { Write-Log "Environment: Windows Preinstallation Environment (WinPE)" -Level SUCCESS }
@@ -485,6 +502,11 @@ function Get-WindowsInstallations {
     <#
     .SYNOPSIS Scans all accessible drive letters for valid Windows installations.
     .NOTES    Does NOT assume C:. Checks for all key Windows files.
+
+    FIX Bug3: The script-drive exclusion only applies when running in WinPE/WinRE.
+    In a standard Windows session the script may live on C: which is also where
+    Windows lives -- skipping it would mean never finding any installation.
+    In WinPE the script runs from the USB (e.g. E:) so excluding it is correct.
     #>
     Write-Log "Scanning for Windows installations on all accessible drives..." -Level SECTION
 
@@ -498,9 +520,11 @@ function Get-WindowsInstallations {
     Write-Log "Checking drives: $($drives -join ', ')"
 
     foreach ($drive in $drives) {
-        # Skip the USB drive this script is running from
-        if ($drive -eq $Script:ScriptDrive.TrimEnd('\')) {
-            Write-Log "  Skipping script drive: $drive"
+        # FIX Bug3: skip script drive only when running inside WinPE/WinRE
+        # In a normal Windows session the USB and Windows share the same drive space
+        # so we must not exclude based on script location.
+        if ($Script:IsWinPE -and ($drive -eq $Script:ScriptDrive.TrimEnd('\'))) {
+            Write-Log "  Skipping script drive (WinPE mode): $drive"
             continue
         }
 
@@ -699,6 +723,11 @@ function Backup-BcdStore {
     <#
     .SYNOPSIS Creates a timestamped backup of the BCD store before any modification.
     .NOTES    Silently skips if log dir not initialized or BCD not found.
+
+    FIX Bug2: Invoke-LoggedCommand is wrapped in try/catch so $exportResult is
+    never $null when StrictMode is active.  Previously if the command threw before
+    returning, $exportResult was unset and accessing .Success caused a StrictMode
+    'property cannot be found' exception.
     #>
     Write-Log "Backing up BCD store..." -Level STEP
 
@@ -710,22 +739,27 @@ function Backup-BcdStore {
     $ts      = Get-Date -Format 'yyyyMMdd_HHmmss'
     $bcdDest = Join-Path $Script:LogDir "BCD_backup_$ts"
 
+    # FIX Bug2: explicit try/catch so $exportResult always has a value after the block
+    $exportResult = $null
     try {
-        # Try bcdedit /export first (most reliable)
         $exportResult = Invoke-LoggedCommand -Command 'bcdedit' `
             -Arguments @('/export', $bcdDest) `
             -Description "BCD export backup" -IgnoreExit
-        if ($exportResult.Success) {
-            Write-Log "BCD exported to: $bcdDest" -Level SUCCESS
-            return $true
-        }
-    } catch {}
+    } catch {
+        Write-Log "Invoke-LoggedCommand threw during BCD export: $_" -Level WARN
+        $exportResult = [PSCustomObject]@{ Output = @(); ExitCode = -1; Success = $false; Skipped = $false }
+    }
+
+    if ($exportResult -and $exportResult.Success) {
+        Write-Log "BCD exported to: $bcdDest" -Level SUCCESS
+        return $true
+    }
 
     try {
         # Fallback: copy BCD file directly from EFI or system partition
         $bcdPaths = @(
             'C:\Boot\BCD',
-            "$($Script:EfiDrive):\EFI\Microsoft\Boot\BCD",
+            "$(if ($Script:EfiDrive) { $Script:EfiDrive } else { 'S' }):\EFI\Microsoft\Boot\BCD",
             'X:\Boot\BCD'
         )
         foreach ($p in $bcdPaths) {
@@ -961,14 +995,14 @@ function Run-Chkdsk {
         $runRecover = Get-UserConfirmation "Also run /R (bad sector recovery - VERY SLOW)? [Y/N]"
     }
 
-    $args = @($driveLetter)
-    if ($runRepair)  { $args += '/F' }
-    if ($runRecover) { $args += '/R' }
-    $args += '/X'   # Force dismount if needed
+    $chkArgs = @($driveLetter)
+    if ($runRepair)  { $chkArgs += '/F' }
+    if ($runRecover) { $chkArgs += '/R' }
+    $chkArgs += '/X'   # Force dismount if needed
 
-    Write-Log "Running: chkdsk $($args -join ' ')" -Level STEP
+    Write-Log "Running: chkdsk $($chkArgs -join ' ')" -Level STEP
     $result = Invoke-LoggedCommand -Command 'chkdsk' `
-        -Arguments $args -Description "CHKDSK on $driveLetter" `
+        -Arguments $chkArgs -Description "CHKDSK on $driveLetter" `
         -SaveRawAs "chkdsk_$($driveLetter.TrimEnd(':')).txt" -IgnoreExit
 
     Write-Log "CHKDSK exit code: $($result.ExitCode)" -Level INFO
@@ -1037,7 +1071,6 @@ function Run-OfflineSfc {
     $sfcLogPath = Join-Path $winDir 'Logs\CBS\CBS.log'
     if (Test-Path $sfcLogPath -ErrorAction SilentlyContinue) {
         Write-Log "SFC/CBS log available at: $sfcLogPath" -Level INFO
-        # Copy CBS log to our log directory
         try {
             $cbsDest = Join-Path $Script:RawLogDir 'CBS.log'
             Copy-Item $sfcLogPath $cbsDest -Force -ErrorAction Stop
@@ -1101,7 +1134,7 @@ function Export-Report {
     $null = $sb.AppendLine("")
     $null = $sb.AppendLine("WINDOWS INSTALLATIONS FOUND: $($Script:WinInstalls.Count)")
     foreach ($inst in $Script:WinInstalls) {
-        $null = $sb.AppendLine(("  - " + $inst.Drive + "\ | " + $inst.Version + " | Build " + $inst.Build + " | " + $inst.BootType))
+        $null = $sb.AppendLine("  - " + $inst.Drive + "\ | " + $inst.Version + " | Build " + $inst.Build + " | " + $inst.BootType)
     }
     $null = $sb.AppendLine("")
     if ($Script:SelectedWin) {
@@ -1126,7 +1159,6 @@ function Export-Report {
     $null = $sb.AppendLine("Transcript   : $Script:TranscriptPath")
     $null = $sb.AppendLine("")
 
-    # VERDICT
     $null = $sb.AppendLine("VERDICT")
     $null = $sb.AppendLine("-"*40)
     $verdict = Get-FinalVerdict
@@ -1280,7 +1312,6 @@ function Main {
     <#
     .SYNOPSIS Main entry point -- initializes and starts the repair tool.
     #>
-    # Clear screen for clean start
     try { Clear-Host } catch {}
 
     Write-Host @"
@@ -1293,25 +1324,18 @@ $('='*60)
 $('='*60)
 "@ -ForegroundColor Cyan
 
-    # Initialize logging first
     Initialize-Logging
 
-    # Detect environment
+    # FIX Bug3: Get-Environment must run BEFORE Get-WindowsInstallations
+    # so $Script:IsWinPE is set correctly before the drive-skip logic executes
     $env = Get-Environment
 
-    # Detect boot mode
     Get-BootMode | Out-Null
-
-    # Enumerate disks
     Get-DiskInventory | Out-Null
-
-    # Detect Windows installations
     Get-WindowsInstallations | Out-Null
 
-    # Show summary of what we found
     Show-DiagnosticSummary
 
-    # If installations found, pre-select if only one
     if ($Script:WinInstalls.Count -gt 0) {
         Select-WindowsInstallation | Out-Null
     } else {
@@ -1322,13 +1346,10 @@ $('='*60)
         Write-Host ""
     }
 
-    # Enter main menu
     Show-MainMenu
 
-    # Cleanup
     Remove-TempEfiLetter
 
-    # Final verdict
     $verdict = Get-FinalVerdict
     Write-Host "`n$('='*60)" -ForegroundColor White
     Write-Host $verdict -ForegroundColor $(
